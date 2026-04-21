@@ -4,3 +4,4 @@ pywavelets>=1.5
 scikit-image>=0.22
 tqdm>=4.66
 torch>=2.1
+torchvision>=0.16

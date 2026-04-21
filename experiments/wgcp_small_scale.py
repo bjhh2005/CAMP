@@ -211,6 +211,65 @@ def make_triplet_panel(images: List[Tensor]) -> Image.Image:
     return canvas
 
 
+def purify_adv_tensor(
+    x_adv: Tensor,
+    alpha_bars: Tensor,
+    predictor: GaussianCTMPredictor,
+    wavelet: str,
+    t_star: int,
+    loop_steps: List[int],
+) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
+    """
+    Purify one adversarial tensor with WGCP.
+    x_adv shape: [1, C, H, W]
+    Returns: (x_corrected, x_final, trace, single_step_infer_ms)
+    """
+    if x_adv.ndim != 4 or x_adv.shape[0] != 1:
+        raise ValueError("x_adv must have shape [1, C, H, W]")
+
+    ll_orig, hf_orig = dwt2_rgb_tensor(x_adv[0], wavelet=wavelet)
+
+    alpha_t = float(alpha_bars[t_star].item())
+    x_t = add_noise(x_adv, alpha_t)
+
+    t0 = time.perf_counter()
+    x0_hat = predictor(x_t, t_star)
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    ll_hat, hf_hat = dwt2_rgb_tensor(x0_hat[0], wavelet=wavelet)
+    x_corrected = idwt2_rgb_tensor(ll_orig, hf_hat, wavelet=wavelet).to(x_adv.device).unsqueeze(0)
+    x_corrected = x_corrected.clamp(0.0, 1.0)
+
+    current = x_corrected.clone()
+    loop_records: List[Dict[str, Tensor]] = []
+    for t_step in loop_steps:
+        alpha_k = float(alpha_bars[t_step].item())
+        x_tk = add_noise(current, alpha_k)
+        x_hat_k = predictor(x_tk, t_step)
+        _, hf_k = dwt2_rgb_tensor(x_hat_k[0], wavelet=wavelet)
+        current = idwt2_rgb_tensor(ll_orig, hf_k, wavelet=wavelet).to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
+        loop_records.append(
+            {
+                "t_step": t_step,
+                "x_tk": x_tk.detach().clone(),
+                "x_hat_k": x_hat_k.detach().clone(),
+                "x_corrected_k": current.detach().clone(),
+            }
+        )
+
+    trace: Dict[str, object] = {
+        "ll_orig": ll_orig,
+        "hf_orig": hf_orig,
+        "x_t": x_t.detach().clone(),
+        "x0_hat": x0_hat.detach().clone(),
+        "ll_hat": ll_hat,
+        "hf_hat": hf_hat,
+        "x_corrected": x_corrected.detach().clone(),
+        "loop_records": loop_records,
+    }
+    return x_corrected, current, trace, infer_ms
+
+
 def process_one_image(
     image_path: Path,
     args: argparse.Namespace,
@@ -231,45 +290,46 @@ def process_one_image(
 
     save_tensor_image(x_adv[0], sample_dir / "00_x_adv.png")
 
-    ll_orig, hf_orig = dwt2_rgb_tensor(x_adv[0], wavelet=args.wavelet)
+    x_corrected, x_final, trace, infer_ms = purify_adv_tensor(
+        x_adv=x_adv,
+        alpha_bars=alpha_bars,
+        predictor=predictor,
+        wavelet=args.wavelet,
+        t_star=args.t_star,
+        loop_steps=loop_steps,
+    )
+
+    ll_orig = trace["ll_orig"]
+    hf_orig = trace["hf_orig"]
     save_tensor_image(ll_orig.clamp(0.0, 1.0), sample_dir / "01_LL_orig.png")
     save_tensor_image(coeff_to_vis(hf_orig["HL"]), sample_dir / "01_HL_orig_vis.png")
     save_tensor_image(coeff_to_vis(hf_orig["LH"]), sample_dir / "01_LH_orig_vis.png")
     save_tensor_image(coeff_to_vis(hf_orig["HH"]), sample_dir / "01_HH_orig_vis.png")
 
-    alpha_t = float(alpha_bars[args.t_star].item())
-    x_t = add_noise(x_adv, alpha_t)
+    x_t = trace["x_t"]
     save_tensor_image(x_t[0].clamp(0.0, 1.0), sample_dir / f"02_x_t{args.t_star}.png")
 
-    t0 = time.perf_counter()
-    x0_hat = predictor(x_t, args.t_star)
-    infer_ms = (time.perf_counter() - t0) * 1000.0
-
+    x0_hat = trace["x0_hat"]
     save_tensor_image(x0_hat[0], sample_dir / "03_x0_hat.png")
 
-    ll_hat, hf_hat = dwt2_rgb_tensor(x0_hat[0], wavelet=args.wavelet)
+    ll_hat = trace["ll_hat"]
+    hf_hat = trace["hf_hat"]
     save_tensor_image(ll_hat.clamp(0.0, 1.0), sample_dir / "04_LL_hat.png")
     save_tensor_image(coeff_to_vis(hf_hat["HL"]), sample_dir / "04_HL_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["LH"]), sample_dir / "04_LH_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["HH"]), sample_dir / "04_HH_hat_vis.png")
 
-    x_corrected = idwt2_rgb_tensor(ll_orig, hf_hat, wavelet=args.wavelet).to(device).unsqueeze(0)
-    x_corrected = x_corrected.clamp(0.0, 1.0)
     save_tensor_image(x_corrected[0], sample_dir / "05_x_corrected.png")
 
-    current = x_corrected.clone()
-    for i, t_step in enumerate(loop_steps, start=1):
-        alpha_k = float(alpha_bars[t_step].item())
-        x_tk = add_noise(current, alpha_k)
-        x_hat_k = predictor(x_tk, t_step)
-        _, hf_k = dwt2_rgb_tensor(x_hat_k[0], wavelet=args.wavelet)
-        current = idwt2_rgb_tensor(ll_orig, hf_k, wavelet=args.wavelet).to(device).unsqueeze(0).clamp(0.0, 1.0)
-
+    for i, record in enumerate(trace["loop_records"], start=1):
+        t_step = int(record["t_step"])
+        x_tk = record["x_tk"]
+        x_hat_k = record["x_hat_k"]
+        x_corr_k = record["x_corrected_k"]
         save_tensor_image(x_tk[0].clamp(0.0, 1.0), sample_dir / f"06_loop{i}_x_t{t_step}.png")
         save_tensor_image(x_hat_k[0], sample_dir / f"06_loop{i}_x_hat.png")
-        save_tensor_image(current[0], sample_dir / f"06_loop{i}_x_corrected.png")
+        save_tensor_image(x_corr_k[0], sample_dir / f"06_loop{i}_x_corrected.png")
 
-    x_final = current
     save_tensor_image(x_final[0], sample_dir / "07_x_final.png")
 
     panel = make_triplet_panel([x_adv[0], x_corrected[0], x_final[0]])
