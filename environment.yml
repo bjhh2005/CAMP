@@ -1,0 +1,15 @@
+name: camp
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy>=1.24
+  - pillow>=10.0
+  - pywavelets>=1.5
+  - scikit-image>=0.22
+  - tqdm>=4.66
+  - pytorch>=2.1
+  - torchvision>=0.16
+  - pip
