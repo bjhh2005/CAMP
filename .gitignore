@@ -210,6 +210,8 @@ models/
 .torch/
 *.pt
 *.pth
+third_party/ctm/
+configs/ctm_server_config.json
 
 # Marimo
 marimo/_static/

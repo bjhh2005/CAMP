@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import json
 import math
 import random
@@ -29,17 +30,67 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--glob", type=str, default="*.png")
     parser.add_argument("--wavelet", type=str, default="haar")
     parser.add_argument("--num_diffusion_steps", type=int, default=1000)
-    parser.add_argument("--t_star", type=int, default=80)
-    parser.add_argument("--self_correct_k", type=int, default=0)
+    parser.add_argument("--t_star", type=int, default=40)
+    parser.add_argument("--self_correct_k", type=int, default=1)
     parser.add_argument(
         "--self_correct_steps",
         type=str,
         default="",
         help="Comma-separated time steps, e.g. 60,40,20",
     )
+    parser.add_argument(
+        "--t_bridge",
+        type=int,
+        default=-1,
+        help="Bridge step t1 for interleaved projection. If <=0, auto uses round(t_star*0.25).",
+    )
     parser.add_argument("--kernel_size", type=int, default=5)
     parser.add_argument("--sigma", type=float, default=1.0)
-    parser.add_argument("--mix", type=float, default=0.8, help="x_t -> denoised blend ratio")
+    parser.add_argument("--mix", type=float, default=0.45, help="x_t -> denoised blend ratio")
+    parser.add_argument(
+        "--predictor_type",
+        type=str,
+        default="gaussian",
+        choices=["gaussian", "module"],
+        help="Predictor backend: built-in gaussian debug model or external module",
+    )
+    parser.add_argument(
+        "--predictor_module",
+        type=str,
+        default="",
+        help="When predictor_type=module, use format 'package.module:ClassName'",
+    )
+    parser.add_argument(
+        "--predictor_kwargs_json",
+        type=str,
+        default="{}",
+        help="JSON string for predictor constructor kwargs when predictor_type=module",
+    )
+    parser.add_argument(
+        "--predictor_image_size",
+        type=int,
+        default=0,
+        help="If >0, resize input to this square size before predictor, then resize back",
+    )
+    parser.add_argument(
+        "--hf_preserve",
+        type=float,
+        default=0.35,
+        help="How much original HF to preserve in replacement (0=full rewrite, 1=full keep)",
+    )
+    parser.add_argument(
+        "--hf_shrink",
+        type=float,
+        default=0.6,
+        help="Soft-threshold factor for original HF before blending (relative to robust sigma)",
+    )
+    parser.add_argument(
+        "--replacement_mode",
+        type=str,
+        default="hard",
+        choices=["hard", "fused"],
+        help="HF replacement strategy: paper-default hard replacement or fused replacement",
+    )
     parser.add_argument("--resize", type=int, nargs=2, default=None, metavar=("H", "W"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -130,6 +181,26 @@ class GaussianCTMPredictor:
         return x0_hat.clamp(0.0, 1.0)
 
 
+def build_predictor(args: argparse.Namespace, device: torch.device):
+    if args.predictor_type == "gaussian":
+        return GaussianCTMPredictor(kernel_size=args.kernel_size, sigma=args.sigma, mix=args.mix)
+
+    if args.predictor_type == "module":
+        if ":" not in args.predictor_module:
+            raise ValueError("predictor_module must be 'package.module:ClassName'")
+        module_name, class_name = args.predictor_module.split(":", 1)
+        module = importlib.import_module(module_name)
+        cls = getattr(module, class_name)
+        kwargs = json.loads(args.predictor_kwargs_json)
+        kwargs.setdefault("device", str(device))
+        predictor = cls(**kwargs)
+        if not callable(predictor):
+            raise TypeError("External predictor must be callable")
+        return predictor
+
+    raise ValueError(f"Unsupported predictor_type: {args.predictor_type}")
+
+
 def build_alpha_bars(num_steps: int, beta_start: float = 1e-4, beta_end: float = 2e-2) -> Tensor:
     betas = torch.linspace(beta_start, beta_end, steps=num_steps)
     alphas = 1.0 - betas
@@ -175,6 +246,60 @@ def idwt2_rgb_tensor(ll_chw: Tensor, hf: Dict[str, Tensor], wavelet: str) -> Ten
     return rec_t
 
 
+def robust_sigma(coeff: Tensor) -> Tensor:
+    flat = coeff.abs().flatten(1)
+    med = flat.median(dim=1).values
+    return med / 0.6745
+
+
+def soft_shrink(coeff: Tensor, tau: Tensor) -> Tensor:
+    while tau.ndim < coeff.ndim:
+        tau = tau.unsqueeze(-1)
+    return coeff.sign() * torch.relu(coeff.abs() - tau)
+
+
+def fuse_high_frequency(
+    hf_orig: Dict[str, Tensor],
+    hf_hat: Dict[str, Tensor],
+    hf_preserve: float,
+    hf_shrink: float,
+) -> Dict[str, Tensor]:
+    preserve = float(np.clip(hf_preserve, 0.0, 1.0))
+    fused: Dict[str, Tensor] = {}
+
+    for band in ("HL", "LH", "HH"):
+        orig = hf_orig[band]
+        hat = hf_hat[band]
+
+        sigma = robust_sigma(orig)
+        tau = hf_shrink * sigma
+        orig_denoised = soft_shrink(orig, tau)
+        fused[band] = (1.0 - preserve) * hat + preserve * orig_denoised
+
+    return fused
+
+
+@torch.no_grad()
+def run_predictor(
+    predictor,
+    x_t: Tensor,
+    t_index: int,
+    predictor_image_size: int,
+) -> Tensor:
+    if predictor_image_size and predictor_image_size > 0:
+        h, w = x_t.shape[-2:]
+        x_small = F.interpolate(
+            x_t,
+            size=(predictor_image_size, predictor_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        x0_small = predictor(x_small, t_index)
+        x0_hat = F.interpolate(x0_small, size=(h, w), mode="bilinear", align_corners=False)
+        return x0_hat.clamp(0.0, 1.0)
+    return predictor(x_t, t_index).clamp(0.0, 1.0)
+
+
 def parse_steps(args: argparse.Namespace) -> List[int]:
     if args.self_correct_k <= 0:
         return []
@@ -185,10 +310,16 @@ def parse_steps(args: argparse.Namespace) -> List[int]:
         if len(steps) < args.self_correct_k:
             raise ValueError("self_correct_steps count is smaller than self_correct_k")
     else:
-        # Auto-generate descending shallow steps from t_star.
-        top = max(2, args.t_star)
-        steps = np.linspace(top, 2, args.self_correct_k + 1, dtype=int).tolist()[:-1]
-    return steps
+        bridge = args.t_bridge if args.t_bridge > 0 else max(2, int(round(args.t_star * 0.25)))
+        if args.self_correct_k == 1:
+            steps = [bridge]
+        else:
+            tail = np.linspace(bridge, 2, args.self_correct_k, dtype=int).tolist()
+            steps = []
+            for s in tail:
+                if not steps or steps[-1] != s:
+                    steps.append(s)
+    return [int(s) for s in steps]
 
 
 def compute_metrics(ref_chw: Tensor, pred_chw: Tensor) -> Dict[str, float]:
@@ -214,10 +345,14 @@ def make_triplet_panel(images: List[Tensor]) -> Image.Image:
 def purify_adv_tensor(
     x_adv: Tensor,
     alpha_bars: Tensor,
-    predictor: GaussianCTMPredictor,
+    predictor,
     wavelet: str,
     t_star: int,
     loop_steps: List[int],
+    hf_preserve: float = 0.35,
+    hf_shrink: float = 0.6,
+    replacement_mode: str = "hard",
+    predictor_image_size: int = 0,
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     """
     Purify one adversarial tensor with WGCP.
@@ -233,27 +368,39 @@ def purify_adv_tensor(
     x_t = add_noise(x_adv, alpha_t)
 
     t0 = time.perf_counter()
-    x0_hat = predictor(x_t, t_star)
+    x0_hat = run_predictor(predictor, x_t, t_star, predictor_image_size=predictor_image_size)
     infer_ms = (time.perf_counter() - t0) * 1000.0
 
     ll_hat, hf_hat = dwt2_rgb_tensor(x0_hat[0], wavelet=wavelet)
-    x_corrected = idwt2_rgb_tensor(ll_orig, hf_hat, wavelet=wavelet).to(x_adv.device).unsqueeze(0)
+    if replacement_mode == "hard":
+        hf_selected = hf_hat
+    elif replacement_mode == "fused":
+        hf_selected = fuse_high_frequency(hf_orig, hf_hat, hf_preserve=hf_preserve, hf_shrink=hf_shrink)
+    else:
+        raise ValueError(f"Unknown replacement_mode: {replacement_mode}")
+
+    x_corrected = idwt2_rgb_tensor(ll_orig, hf_selected, wavelet=wavelet).to(x_adv.device).unsqueeze(0)
     x_corrected = x_corrected.clamp(0.0, 1.0)
 
     current = x_corrected.clone()
-    loop_records: List[Dict[str, Tensor]] = []
+    loop_records: List[Dict[str, object]] = []
     for t_step in loop_steps:
         alpha_k = float(alpha_bars[t_step].item())
         x_tk = add_noise(current, alpha_k)
-        x_hat_k = predictor(x_tk, t_step)
+        x_hat_k = run_predictor(predictor, x_tk, t_step, predictor_image_size=predictor_image_size)
         _, hf_k = dwt2_rgb_tensor(x_hat_k[0], wavelet=wavelet)
-        current = idwt2_rgb_tensor(ll_orig, hf_k, wavelet=wavelet).to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
+        if replacement_mode == "hard":
+            hf_k_selected = hf_k
+        else:
+            hf_k_selected = fuse_high_frequency(hf_orig, hf_k, hf_preserve=hf_preserve, hf_shrink=hf_shrink)
+        current = idwt2_rgb_tensor(ll_orig, hf_k_selected, wavelet=wavelet).to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
         loop_records.append(
             {
                 "t_step": t_step,
                 "x_tk": x_tk.detach().clone(),
                 "x_hat_k": x_hat_k.detach().clone(),
                 "x_corrected_k": current.detach().clone(),
+                "hf_k_selected": {k: v.detach().clone() for k, v in hf_k_selected.items()},
             }
         )
 
@@ -264,6 +411,7 @@ def purify_adv_tensor(
         "x0_hat": x0_hat.detach().clone(),
         "ll_hat": ll_hat,
         "hf_hat": hf_hat,
+        "hf_selected": hf_selected,
         "x_corrected": x_corrected.detach().clone(),
         "loop_records": loop_records,
     }
@@ -274,7 +422,7 @@ def process_one_image(
     image_path: Path,
     args: argparse.Namespace,
     alpha_bars: Tensor,
-    predictor: GaussianCTMPredictor,
+    predictor,
     loop_steps: List[int],
     device: torch.device,
 ) -> Dict[str, object]:
@@ -297,6 +445,10 @@ def process_one_image(
         wavelet=args.wavelet,
         t_star=args.t_star,
         loop_steps=loop_steps,
+        hf_preserve=args.hf_preserve,
+        hf_shrink=args.hf_shrink,
+        replacement_mode=args.replacement_mode,
+        predictor_image_size=args.predictor_image_size,
     )
 
     ll_orig = trace["ll_orig"]
@@ -314,11 +466,16 @@ def process_one_image(
 
     ll_hat = trace["ll_hat"]
     hf_hat = trace["hf_hat"]
+    hf_selected = trace["hf_selected"]
     save_tensor_image(ll_hat.clamp(0.0, 1.0), sample_dir / "04_LL_hat.png")
     save_tensor_image(coeff_to_vis(hf_hat["HL"]), sample_dir / "04_HL_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["LH"]), sample_dir / "04_LH_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["HH"]), sample_dir / "04_HH_hat_vis.png")
+    save_tensor_image(coeff_to_vis(hf_selected["HL"]), sample_dir / "04_HL_selected_vis.png")
+    save_tensor_image(coeff_to_vis(hf_selected["LH"]), sample_dir / "04_LH_selected_vis.png")
+    save_tensor_image(coeff_to_vis(hf_selected["HH"]), sample_dir / "04_HH_selected_vis.png")
 
+    save_tensor_image(x_corrected[0], sample_dir / "05_x_assembled.png")
     save_tensor_image(x_corrected[0], sample_dir / "05_x_corrected.png")
 
     for i, record in enumerate(trace["loop_records"], start=1):
@@ -356,7 +513,13 @@ def process_one_image(
         "image": str(image_path),
         "wavelet": args.wavelet,
         "t_star": args.t_star,
+        "t_bridge": args.t_bridge if args.t_bridge > 0 else max(2, int(round(args.t_star * 0.25))),
         "self_correct_steps": loop_steps,
+        "predictor_type": args.predictor_type,
+        "predictor_image_size": args.predictor_image_size,
+        "replacement_mode": args.replacement_mode,
+        "hf_preserve": args.hf_preserve,
+        "hf_shrink": args.hf_shrink,
         "metrics": metrics,
     }
 
@@ -390,7 +553,7 @@ def main() -> None:
     if not image_paths:
         raise FileNotFoundError(f"No images found in {args.input_dir}")
 
-    predictor = GaussianCTMPredictor(kernel_size=args.kernel_size, sigma=args.sigma, mix=args.mix)
+    predictor = build_predictor(args, device=device)
 
     results = []
     for path in tqdm(image_paths, desc="WGCP small-scale"):

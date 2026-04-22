@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 try:
     from wgcp_small_scale import (
-        GaussianCTMPredictor,
+        build_predictor,
         build_alpha_bars,
         coeff_to_vis,
         compute_metrics,
@@ -21,12 +21,13 @@ try:
         make_triplet_panel,
         pil_to_tensor,
         purify_adv_tensor,
+        run_predictor,
         save_tensor_image,
         set_seed,
     )
 except ImportError:
     from experiments.wgcp_small_scale import (
-        GaussianCTMPredictor,
+        build_predictor,
         build_alpha_bars,
         coeff_to_vis,
         compute_metrics,
@@ -35,6 +36,7 @@ except ImportError:
         make_triplet_panel,
         pil_to_tensor,
         purify_adv_tensor,
+        run_predictor,
         save_tensor_image,
         set_seed,
     )
@@ -52,6 +54,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_images", type=int, default=8)
     parser.add_argument("--glob", type=str, default="*.png")
     parser.add_argument("--resize", type=int, nargs=2, default=None, metavar=("H", "W"))
+    parser.add_argument("--clf_resize_short", type=int, default=256, help="Classifier pre-resize short side")
+    parser.add_argument("--clf_crop_size", type=int, default=224, help="Classifier center-crop size")
+    parser.add_argument(
+        "--min_clean_conf",
+        type=float,
+        default=0.05,
+        help="Skip pseudo-label evaluation for samples with clean confidence below this threshold",
+    )
 
     parser.add_argument("--classifier", type=str, default="resnet50", choices=["resnet18", "resnet50", "mobilenet_v3_large"])
     parser.add_argument(
@@ -68,24 +78,74 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--wavelet", type=str, default="haar")
     parser.add_argument("--num_diffusion_steps", type=int, default=1000)
-    parser.add_argument("--t_star", type=int, default=80)
-    parser.add_argument("--self_correct_k", type=int, default=0)
+    parser.add_argument("--t_star", type=int, default=40)
+    parser.add_argument("--self_correct_k", type=int, default=1)
     parser.add_argument(
         "--self_correct_steps",
         type=str,
         default="",
         help="Comma-separated time steps, e.g. 60,40,20",
     )
+    parser.add_argument(
+        "--t_bridge",
+        type=int,
+        default=-1,
+        help="Bridge step t1 for interleaved projection. If <=0, auto uses round(t_star*0.25).",
+    )
     parser.add_argument("--kernel_size", type=int, default=5)
     parser.add_argument("--sigma", type=float, default=1.0)
-    parser.add_argument("--mix", type=float, default=0.8)
+    parser.add_argument("--mix", type=float, default=0.45)
+    parser.add_argument(
+        "--predictor_type",
+        type=str,
+        default="gaussian",
+        choices=["gaussian", "module"],
+        help="Predictor backend: built-in gaussian debug model or external module",
+    )
+    parser.add_argument(
+        "--predictor_module",
+        type=str,
+        default="",
+        help="When predictor_type=module, use format 'package.module:ClassName'",
+    )
+    parser.add_argument(
+        "--predictor_kwargs_json",
+        type=str,
+        default="{}",
+        help="JSON string for predictor constructor kwargs when predictor_type=module",
+    )
+    parser.add_argument(
+        "--predictor_image_size",
+        type=int,
+        default=0,
+        help="If >0, resize input to this square size before predictor, then resize back",
+    )
+    parser.add_argument(
+        "--hf_preserve",
+        type=float,
+        default=0.35,
+        help="How much original HF to preserve in replacement (0=full rewrite, 1=full keep)",
+    )
+    parser.add_argument(
+        "--hf_shrink",
+        type=float,
+        default=0.6,
+        help="Soft-threshold factor for original HF before blending (relative to robust sigma)",
+    )
+    parser.add_argument(
+        "--replacement_mode",
+        type=str,
+        default="hard",
+        choices=["hard", "fused"],
+        help="HF replacement strategy: paper-default hard replacement or fused replacement",
+    )
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
 
-def parse_loop_steps(self_correct_k: int, self_correct_steps: str, t_star: int) -> List[int]:
+def parse_loop_steps(self_correct_k: int, self_correct_steps: str, t_star: int, t_bridge: int) -> List[int]:
     if self_correct_k <= 0:
         return []
     if self_correct_steps.strip():
@@ -93,10 +153,17 @@ def parse_loop_steps(self_correct_k: int, self_correct_steps: str, t_star: int) 
         steps = steps[:self_correct_k]
         if len(steps) < self_correct_k:
             raise ValueError("self_correct_steps count is smaller than self_correct_k")
-        return steps
+        return [int(s) for s in steps]
 
-    top = max(2, t_star)
-    return np.linspace(top, 2, self_correct_k + 1, dtype=int).tolist()[:-1]
+    bridge = t_bridge if t_bridge > 0 else max(2, int(round(t_star * 0.25)))
+    if self_correct_k == 1:
+        return [int(bridge)]
+    tail = np.linspace(bridge, 2, self_correct_k, dtype=int).tolist()
+    out: List[int] = []
+    for s in tail:
+        if not out or out[-1] != s:
+            out.append(int(s))
+    return out
 
 
 def setup_weight_cache(cache_dir: Path) -> None:
@@ -134,17 +201,65 @@ def imagenet_normalize(x: Tensor) -> Tensor:
     return (x - mean) / std
 
 
+def imagenet_preprocess(x: Tensor, resize_short: int = 256, crop_size: int = 224) -> Tensor:
+    if x.ndim != 4:
+        raise ValueError("Expected x with shape [B, C, H, W]")
+
+    out = x
+    h, w = out.shape[-2], out.shape[-1]
+
+    if resize_short > 0:
+        short = min(h, w)
+        scale = resize_short / float(short)
+        new_h = max(1, int(round(h * scale)))
+        new_w = max(1, int(round(w * scale)))
+        out = F.interpolate(out, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        h, w = out.shape[-2], out.shape[-1]
+
+    if crop_size > 0:
+        if h < crop_size or w < crop_size:
+            out = F.interpolate(out, size=(max(h, crop_size), max(w, crop_size)), mode="bilinear", align_corners=False)
+            h, w = out.shape[-2], out.shape[-1]
+        top = (h - crop_size) // 2
+        left = (w - crop_size) // 2
+        out = out[:, :, top : top + crop_size, left : left + crop_size]
+
+    return out
+
+
+def classifier_logits(
+    model: torch.nn.Module,
+    x: Tensor,
+    resize_short: int,
+    crop_size: int,
+) -> Tensor:
+    x_in = imagenet_preprocess(x, resize_short=resize_short, crop_size=crop_size)
+    return model(imagenet_normalize(x_in))
+
+
 @torch.no_grad()
-def classify(model: torch.nn.Module, x: Tensor) -> Tuple[Tensor, Tensor]:
-    logits = model(imagenet_normalize(x))
+def classify(
+    model: torch.nn.Module,
+    x: Tensor,
+    resize_short: int,
+    crop_size: int,
+) -> Tuple[Tensor, Tensor]:
+    logits = classifier_logits(model, x, resize_short=resize_short, crop_size=crop_size)
     probs = torch.softmax(logits, dim=1)
     conf, pred = probs.max(dim=1)
     return pred, conf
 
 
-def fgsm_attack(model: torch.nn.Module, x: Tensor, y_ref: Tensor, eps: float) -> Tensor:
+def fgsm_attack(
+    model: torch.nn.Module,
+    x: Tensor,
+    y_ref: Tensor,
+    eps: float,
+    resize_short: int,
+    crop_size: int,
+) -> Tensor:
     x_adv = x.detach().clone().requires_grad_(True)
-    logits = model(imagenet_normalize(x_adv))
+    logits = classifier_logits(model, x_adv, resize_short=resize_short, crop_size=crop_size)
     loss = F.cross_entropy(logits, y_ref)
     model.zero_grad(set_to_none=True)
     loss.backward()
@@ -152,14 +267,23 @@ def fgsm_attack(model: torch.nn.Module, x: Tensor, y_ref: Tensor, eps: float) ->
     return x_adv.detach().clamp(0.0, 1.0)
 
 
-def pgd_attack(model: torch.nn.Module, x: Tensor, y_ref: Tensor, eps: float, alpha: float, steps: int) -> Tensor:
+def pgd_attack(
+    model: torch.nn.Module,
+    x: Tensor,
+    y_ref: Tensor,
+    eps: float,
+    alpha: float,
+    steps: int,
+    resize_short: int,
+    crop_size: int,
+) -> Tensor:
     x_orig = x.detach().clone()
     x_adv = x_orig + torch.empty_like(x_orig).uniform_(-eps, eps)
     x_adv = x_adv.clamp(0.0, 1.0)
 
     for _ in range(steps):
         x_adv = x_adv.detach().clone().requires_grad_(True)
-        logits = model(imagenet_normalize(x_adv))
+        logits = classifier_logits(model, x_adv, resize_short=resize_short, crop_size=crop_size)
         loss = F.cross_entropy(logits, y_ref)
         model.zero_grad(set_to_none=True)
         loss.backward()
@@ -184,6 +308,7 @@ def save_purify_trace(sample_dir: Path, t_star: int, trace: Dict[str, object], x
     x0_hat = trace["x0_hat"]
     ll_hat = trace["ll_hat"]
     hf_hat = trace["hf_hat"]
+    hf_selected = trace["hf_selected"]
 
     save_tensor_image(x_t[0].clamp(0.0, 1.0), sample_dir / f"03_x_t{t_star}.png")
     save_tensor_image(x0_hat[0], sample_dir / "04_x0_hat.png")
@@ -191,7 +316,11 @@ def save_purify_trace(sample_dir: Path, t_star: int, trace: Dict[str, object], x
     save_tensor_image(coeff_to_vis(hf_hat["HL"]), sample_dir / "05_HL_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["LH"]), sample_dir / "05_LH_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["HH"]), sample_dir / "05_HH_hat_vis.png")
+    save_tensor_image(coeff_to_vis(hf_selected["HL"]), sample_dir / "05_HL_selected_vis.png")
+    save_tensor_image(coeff_to_vis(hf_selected["LH"]), sample_dir / "05_LH_selected_vis.png")
+    save_tensor_image(coeff_to_vis(hf_selected["HH"]), sample_dir / "05_HH_selected_vis.png")
 
+    save_tensor_image(x_corrected[0], sample_dir / "06_x_assembled.png")
     save_tensor_image(x_corrected[0], sample_dir / "06_x_corrected.png")
 
     for i, record in enumerate(trace["loop_records"], start=1):
@@ -211,7 +340,7 @@ def main() -> None:
     if args.t_star <= 0 or args.t_star >= args.num_diffusion_steps:
         raise ValueError("t_star must be in (0, num_diffusion_steps)")
 
-    loop_steps = parse_loop_steps(args.self_correct_k, args.self_correct_steps, args.t_star)
+    loop_steps = parse_loop_steps(args.self_correct_k, args.self_correct_steps, args.t_star, args.t_bridge)
     for step in loop_steps:
         if step <= 0 or step >= args.num_diffusion_steps:
             raise ValueError("all self-correct steps must be in (0, num_diffusion_steps)")
@@ -220,14 +349,20 @@ def main() -> None:
 
     device = torch.device(args.device)
     alpha_bars = build_alpha_bars(args.num_diffusion_steps).to(device)
-    predictor = GaussianCTMPredictor(kernel_size=args.kernel_size, sigma=args.sigma, mix=args.mix)
+    predictor = build_predictor(args, device=device)
     classifier = load_classifier(args.classifier, device)
+    with torch.no_grad():
+        warmup = torch.rand(1, 3, 256, 256, device=device)
+        _ = run_predictor(predictor, warmup, args.t_star, predictor_image_size=args.predictor_image_size)
+        _ = classify(classifier, warmup, resize_short=args.clf_resize_short, crop_size=args.clf_crop_size)
 
     image_paths = list_images(args.input_dir, args.glob, args.max_images)
     if not image_paths:
         raise FileNotFoundError(f"No images found in {args.input_dir}")
 
     per_sample: List[Dict[str, object]] = []
+    valid_sample_count = 0
+    skipped_low_conf_count = 0
 
     for image_path in tqdm(image_paths, desc="WGCP attack+eval"):
         sample_dir = args.output_dir / image_path.stem
@@ -241,16 +376,62 @@ def main() -> None:
         x_clean = pil_to_tensor(clean_img).unsqueeze(0).to(device)
         save_tensor_image(x_clean[0], sample_dir / "00_x_clean.png")
 
-        pred_clean, conf_clean = classify(classifier, x_clean)
+        pred_clean, conf_clean = classify(
+            classifier,
+            x_clean,
+            resize_short=args.clf_resize_short,
+            crop_size=args.clf_crop_size,
+        )
+        if hasattr(predictor, "set_class_label"):
+            predictor.set_class_label(int(pred_clean.item()))
+        if conf_clean.item() < args.min_clean_conf:
+            skipped_low_conf_count += 1
+            record = {
+                "image": str(image_path),
+                "classifier": args.classifier,
+                "skipped": True,
+                "skip_reason": f"clean_conf<{args.min_clean_conf}",
+                "pseudo_label_eval": {
+                    "clean_pred": int(pred_clean.item()),
+                    "clean_conf": float(conf_clean.item()),
+                },
+            }
+            with open(sample_dir / "metrics.json", "w", encoding="utf-8") as f:
+                json.dump(record, f, ensure_ascii=False, indent=2)
+            per_sample.append(record)
+            continue
+
+        valid_sample_count += 1
         y_ref = pred_clean.detach()
 
         if args.attack == "fgsm":
-            x_adv = fgsm_attack(classifier, x_clean, y_ref, eps=args.eps)
+            x_adv = fgsm_attack(
+                classifier,
+                x_clean,
+                y_ref,
+                eps=args.eps,
+                resize_short=args.clf_resize_short,
+                crop_size=args.clf_crop_size,
+            )
         else:
-            x_adv = pgd_attack(classifier, x_clean, y_ref, eps=args.eps, alpha=args.pgd_alpha, steps=args.pgd_steps)
+            x_adv = pgd_attack(
+                classifier,
+                x_clean,
+                y_ref,
+                eps=args.eps,
+                alpha=args.pgd_alpha,
+                steps=args.pgd_steps,
+                resize_short=args.clf_resize_short,
+                crop_size=args.clf_crop_size,
+            )
 
         save_tensor_image(x_adv[0], sample_dir / "01_x_adv.png")
-        pred_adv, conf_adv = classify(classifier, x_adv)
+        pred_adv, conf_adv = classify(
+            classifier,
+            x_adv,
+            resize_short=args.clf_resize_short,
+            crop_size=args.clf_crop_size,
+        )
 
         x_corrected, x_final, trace, infer_ms = purify_adv_tensor(
             x_adv=x_adv,
@@ -259,10 +440,19 @@ def main() -> None:
             wavelet=args.wavelet,
             t_star=args.t_star,
             loop_steps=loop_steps,
+            hf_preserve=args.hf_preserve,
+            hf_shrink=args.hf_shrink,
+            replacement_mode=args.replacement_mode,
+            predictor_image_size=args.predictor_image_size,
         )
         save_purify_trace(sample_dir, args.t_star, trace, x_corrected, x_final)
 
-        pred_final, conf_final = classify(classifier, x_final)
+        pred_final, conf_final = classify(
+            classifier,
+            x_final,
+            resize_short=args.clf_resize_short,
+            crop_size=args.clf_crop_size,
+        )
 
         panel_clean_adv_final = make_triplet_panel([x_clean[0], x_adv[0], x_final[0]])
         panel_clean_adv_final.save(sample_dir / "09_compare_clean_adv_final.png")
@@ -288,9 +478,15 @@ def main() -> None:
             "wgcp": {
                 "wavelet": args.wavelet,
                 "t_star": args.t_star,
+                "t_bridge": args.t_bridge if args.t_bridge > 0 else max(2, int(round(args.t_star * 0.25))),
                 "self_correct_steps": loop_steps,
                 "NFE": 1 + len(loop_steps),
                 "single_step_infer_ms": float(infer_ms),
+                "predictor_type": args.predictor_type,
+                "predictor_image_size": args.predictor_image_size,
+                "replacement_mode": args.replacement_mode,
+                "hf_preserve": args.hf_preserve,
+                "hf_shrink": args.hf_shrink,
             },
             "pseudo_label_eval": {
                 "clean_pred": int(pred_clean.item()),
@@ -313,19 +509,25 @@ def main() -> None:
 
         per_sample.append(record)
 
-    attacked = sum(int(item["pseudo_label_eval"]["attack_success"]) for item in per_sample)
+    valid_samples = [item for item in per_sample if not item.get("skipped", False)]
+    attacked = sum(int(item["pseudo_label_eval"]["attack_success"]) for item in valid_samples)
     recovered = sum(
-        int(item["pseudo_label_eval"]["recover_to_clean_pred"]) for item in per_sample if item["pseudo_label_eval"]["attack_success"]
+        int(item["pseudo_label_eval"]["recover_to_clean_pred"])
+        for item in valid_samples
+        if item["pseudo_label_eval"]["attack_success"]
     )
-    overall_consistent = sum(int(item["pseudo_label_eval"]["recover_to_clean_pred"]) for item in per_sample)
+    overall_consistent = sum(int(item["pseudo_label_eval"]["recover_to_clean_pred"]) for item in valid_samples)
 
     aggregate = {
         "num_samples": len(per_sample),
+        "num_valid_samples": valid_sample_count,
+        "num_skipped_low_conf": skipped_low_conf_count,
+        "min_clean_conf": args.min_clean_conf,
         "num_attack_success": attacked,
-        "attack_success_rate": attacked / max(1, len(per_sample)),
+        "attack_success_rate": attacked / max(1, valid_sample_count),
         "recover_rate_on_attacked": recovered / max(1, attacked),
-        "clean_pred_consistency_rate": overall_consistent / max(1, len(per_sample)),
-        "note": "This script uses clean-image predicted label as pseudo-label (no ground-truth required).",
+        "clean_pred_consistency_rate": overall_consistent / max(1, valid_sample_count),
+        "note": "This script uses clean-image predicted label as pseudo-label (no ground-truth required). Low-confidence clean samples can be skipped.",
     }
 
     summary = {
