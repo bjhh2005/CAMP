@@ -81,6 +81,14 @@ cd /path/to/CAMP
 bash scripts/run_wgcp_ctm_server.sh /path/to/clean_samples /path/to/outputs/wgcp_eval_ctm
 ```
 
+如需一次性跑完整消融矩阵（A0-A5）：
+
+```bash
+bash scripts/run_ablation_ctm_server.sh /path/to/clean_samples /path/to/outputs/wgcp_ablation_ctm
+```
+
+详细解释见：`docs/消融实验方案.md`
+
 可选环境变量：
 
 ```bash
@@ -89,6 +97,15 @@ CTM_CLASS_LABEL=0 \
 TORCH_CACHE_DIR=/data/model_cache/camp_torch \
 bash scripts/run_wgcp_ctm_server.sh /data/clean_samples /data/outputs/wgcp_eval_ctm
 ```
+
+归档说明：
+
+- 每次运行都会把 `summary.json` 额外归档一份到仓库外默认目录：
+  `~/.camp_runs/CAMP/wgcp_attack_eval/<timestamp>.json`
+- 可选参数：
+  `--archive_dir /abs/path/to/archive_root`
+  `--archive_tag your_tag`
+  `--disable_archive`
 
 ## 5. 手动运行命令（可选）
 

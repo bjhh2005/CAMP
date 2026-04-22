@@ -4,6 +4,13 @@ import json
 import math
 import random
 import time
+import getpass
+import platform
+import shlex
+import socket
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -91,7 +98,29 @@ def parse_args() -> argparse.Namespace:
         choices=["hard", "fused"],
         help="HF replacement strategy: paper-default hard replacement or fused replacement",
     )
+    parser.add_argument(
+        "--ablation_ll_source",
+        type=str,
+        default="orig",
+        choices=["orig", "hat"],
+        help="Ablation only: LL source for IDWT anchor. 'orig'=paper default, 'hat'=predictor LL.",
+    )
+    parser.add_argument(
+        "--ablation_hard_hf_source",
+        type=str,
+        default="pred",
+        choices=["pred", "orig"],
+        help="Ablation only under replacement_mode=hard: HF source. 'pred'=paper default, 'orig'=keep original HF.",
+    )
     parser.add_argument("--resize", type=int, nargs=2, default=None, metavar=("H", "W"))
+    parser.add_argument(
+        "--archive_dir",
+        type=Path,
+        default=Path.home() / ".camp_runs" / "CAMP",
+        help="Directory for archived run records (default outside repo).",
+    )
+    parser.add_argument("--archive_tag", type=str, default="", help="Optional tag appended to archive filename.")
+    parser.add_argument("--disable_archive", action="store_true", help="Disable extra archived run record.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -342,6 +371,64 @@ def make_triplet_panel(images: List[Tensor]) -> Image.Image:
     return canvas
 
 
+def _safe_git_commit() -> Optional[str]:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _jsonable_args(args: argparse.Namespace) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for k, v in vars(args).items():
+        if isinstance(v, Path):
+            out[k] = str(v)
+        else:
+            out[k] = v
+    return out
+
+
+def build_run_meta(args: argparse.Namespace) -> Dict[str, object]:
+    now_local = datetime.now().astimezone()
+    now_utc = datetime.now(timezone.utc)
+    return {
+        "run_id": now_local.strftime("%Y%m%d_%H%M%S_%f")[:-3],
+        "timestamp_local": now_local.isoformat(),
+        "timestamp_utc": now_utc.isoformat(),
+        "script": str(Path(__file__).resolve()),
+        "command": " ".join(shlex.quote(x) for x in sys.argv),
+        "cwd": str(Path.cwd()),
+        "hostname": socket.gethostname(),
+        "user": getpass.getuser(),
+        "platform": platform.platform(),
+        "python_version": sys.version,
+        "git_commit": _safe_git_commit(),
+        "args": _jsonable_args(args),
+        "torch": {
+            "version": torch.__version__,
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_version": torch.version.cuda,
+        },
+    }
+
+
+def archive_run_record(args: argparse.Namespace, summary_obj: Dict[str, object], script_name: str) -> Optional[Path]:
+    if args.disable_archive:
+        return None
+
+    archive_root = args.archive_dir.expanduser().resolve()
+    archive_dir = archive_root / script_name
+    ensure_dir(archive_dir)
+
+    run_id = str(summary_obj["run_meta"]["run_id"])
+    tag = f"_{args.archive_tag.strip()}" if args.archive_tag.strip() else ""
+    archive_path = archive_dir / f"{run_id}{tag}.json"
+    with open(archive_path, "w", encoding="utf-8") as f:
+        json.dump(summary_obj, f, ensure_ascii=False, indent=2)
+    return archive_path
+
+
 def purify_adv_tensor(
     x_adv: Tensor,
     alpha_bars: Tensor,
@@ -353,6 +440,8 @@ def purify_adv_tensor(
     hf_shrink: float = 0.6,
     replacement_mode: str = "hard",
     predictor_image_size: int = 0,
+    ablation_ll_source: str = "orig",
+    ablation_hard_hf_source: str = "pred",
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     """
     Purify one adversarial tensor with WGCP.
@@ -372,14 +461,16 @@ def purify_adv_tensor(
     infer_ms = (time.perf_counter() - t0) * 1000.0
 
     ll_hat, hf_hat = dwt2_rgb_tensor(x0_hat[0], wavelet=wavelet)
+    ll_anchor = ll_orig if ablation_ll_source == "orig" else ll_hat
+    # CAMP default: keep LL from x_adv (ll_orig) and use predictor HF under hard replacement.
     if replacement_mode == "hard":
-        hf_selected = hf_hat
+        hf_selected = hf_hat if ablation_hard_hf_source == "pred" else hf_orig
     elif replacement_mode == "fused":
         hf_selected = fuse_high_frequency(hf_orig, hf_hat, hf_preserve=hf_preserve, hf_shrink=hf_shrink)
     else:
         raise ValueError(f"Unknown replacement_mode: {replacement_mode}")
 
-    x_corrected = idwt2_rgb_tensor(ll_orig, hf_selected, wavelet=wavelet).to(x_adv.device).unsqueeze(0)
+    x_corrected = idwt2_rgb_tensor(ll_anchor, hf_selected, wavelet=wavelet).to(x_adv.device).unsqueeze(0)
     x_corrected = x_corrected.clamp(0.0, 1.0)
 
     current = x_corrected.clone()
@@ -388,18 +479,20 @@ def purify_adv_tensor(
         alpha_k = float(alpha_bars[t_step].item())
         x_tk = add_noise(current, alpha_k)
         x_hat_k = run_predictor(predictor, x_tk, t_step, predictor_image_size=predictor_image_size)
-        _, hf_k = dwt2_rgb_tensor(x_hat_k[0], wavelet=wavelet)
+        ll_k, hf_k = dwt2_rgb_tensor(x_hat_k[0], wavelet=wavelet)
+        ll_anchor_k = ll_orig if ablation_ll_source == "orig" else ll_k
         if replacement_mode == "hard":
-            hf_k_selected = hf_k
+            hf_k_selected = hf_k if ablation_hard_hf_source == "pred" else hf_orig
         else:
             hf_k_selected = fuse_high_frequency(hf_orig, hf_k, hf_preserve=hf_preserve, hf_shrink=hf_shrink)
-        current = idwt2_rgb_tensor(ll_orig, hf_k_selected, wavelet=wavelet).to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
+        current = idwt2_rgb_tensor(ll_anchor_k, hf_k_selected, wavelet=wavelet).to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
         loop_records.append(
             {
                 "t_step": t_step,
                 "x_tk": x_tk.detach().clone(),
                 "x_hat_k": x_hat_k.detach().clone(),
                 "x_corrected_k": current.detach().clone(),
+                "ll_anchor_source": ablation_ll_source,
                 "hf_k_selected": {k: v.detach().clone() for k, v in hf_k_selected.items()},
             }
         )
@@ -411,9 +504,14 @@ def purify_adv_tensor(
         "x0_hat": x0_hat.detach().clone(),
         "ll_hat": ll_hat,
         "hf_hat": hf_hat,
+        "ll_anchor": ll_anchor,
         "hf_selected": hf_selected,
         "x_corrected": x_corrected.detach().clone(),
         "loop_records": loop_records,
+        "ablation": {
+            "ll_source": ablation_ll_source,
+            "hard_hf_source": ablation_hard_hf_source,
+        },
     }
     return x_corrected, current, trace, infer_ms
 
@@ -449,6 +547,8 @@ def process_one_image(
         hf_shrink=args.hf_shrink,
         replacement_mode=args.replacement_mode,
         predictor_image_size=args.predictor_image_size,
+        ablation_ll_source=args.ablation_ll_source,
+        ablation_hard_hf_source=args.ablation_hard_hf_source,
     )
 
     ll_orig = trace["ll_orig"]
@@ -465,9 +565,11 @@ def process_one_image(
     save_tensor_image(x0_hat[0], sample_dir / "03_x0_hat.png")
 
     ll_hat = trace["ll_hat"]
+    ll_anchor = trace["ll_anchor"]
     hf_hat = trace["hf_hat"]
     hf_selected = trace["hf_selected"]
     save_tensor_image(ll_hat.clamp(0.0, 1.0), sample_dir / "04_LL_hat.png")
+    save_tensor_image(ll_anchor.clamp(0.0, 1.0), sample_dir / "04_LL_anchor.png")
     save_tensor_image(coeff_to_vis(hf_hat["HL"]), sample_dir / "04_HL_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["LH"]), sample_dir / "04_LH_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["HH"]), sample_dir / "04_HH_hat_vis.png")
@@ -518,6 +620,8 @@ def process_one_image(
         "predictor_type": args.predictor_type,
         "predictor_image_size": args.predictor_image_size,
         "replacement_mode": args.replacement_mode,
+        "ablation_ll_source": args.ablation_ll_source,
+        "ablation_hard_hf_source": args.ablation_hard_hf_source,
         "hf_preserve": args.hf_preserve,
         "hf_shrink": args.hf_shrink,
         "metrics": metrics,
@@ -560,12 +664,22 @@ def main() -> None:
         result = process_one_image(path, args, alpha_bars, predictor, loop_steps, device)
         results.append(result)
 
+    run_meta = build_run_meta(args)
+    summary_obj: Dict[str, object] = {
+        "run_meta": run_meta,
+        "samples": results,
+    }
+
     summary_path = args.output_dir / "summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+        json.dump(summary_obj, f, ensure_ascii=False, indent=2)
+
+    archive_path = archive_run_record(args, summary_obj, script_name="wgcp_small_scale")
 
     print(f"Done. Results saved to: {args.output_dir}")
     print(f"Summary: {summary_path}")
+    if archive_path is not None:
+        print(f"Archived summary: {archive_path}")
 
 
 if __name__ == "__main__":

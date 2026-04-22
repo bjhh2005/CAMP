@@ -1,6 +1,13 @@
 import argparse
+import getpass
 import json
 import os
+import platform
+import shlex
+import socket
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -62,6 +69,14 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Skip pseudo-label evaluation for samples with clean confidence below this threshold",
     )
+    parser.add_argument(
+        "--archive_dir",
+        type=Path,
+        default=Path.home() / ".camp_runs" / "CAMP",
+        help="Directory for archived run records (default outside repo).",
+    )
+    parser.add_argument("--archive_tag", type=str, default="", help="Optional tag appended to archive filename.")
+    parser.add_argument("--disable_archive", action="store_true", help="Disable extra archived run record.")
 
     parser.add_argument("--classifier", type=str, default="resnet50", choices=["resnet18", "resnet50", "mobilenet_v3_large"])
     parser.add_argument(
@@ -139,6 +154,20 @@ def parse_args() -> argparse.Namespace:
         choices=["hard", "fused"],
         help="HF replacement strategy: paper-default hard replacement or fused replacement",
     )
+    parser.add_argument(
+        "--ablation_ll_source",
+        type=str,
+        default="orig",
+        choices=["orig", "hat"],
+        help="Ablation only: LL source for IDWT anchor. 'orig'=paper default, 'hat'=predictor LL.",
+    )
+    parser.add_argument(
+        "--ablation_hard_hf_source",
+        type=str,
+        default="pred",
+        choices=["pred", "orig"],
+        help="Ablation only under replacement_mode=hard: HF source. 'pred'=paper default, 'orig'=keep original HF.",
+    )
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -170,6 +199,64 @@ def setup_weight_cache(cache_dir: Path) -> None:
     cache_dir = cache_dir.expanduser().resolve()
     ensure_dir(cache_dir)
     os.environ["TORCH_HOME"] = str(cache_dir)
+
+
+def _safe_git_commit() -> str | None:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _jsonable_args(args: argparse.Namespace) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for k, v in vars(args).items():
+        if isinstance(v, Path):
+            out[k] = str(v)
+        else:
+            out[k] = v
+    return out
+
+
+def build_run_meta(args: argparse.Namespace) -> Dict[str, object]:
+    now_local = datetime.now().astimezone()
+    now_utc = datetime.now(timezone.utc)
+    return {
+        "run_id": now_local.strftime("%Y%m%d_%H%M%S_%f")[:-3],
+        "timestamp_local": now_local.isoformat(),
+        "timestamp_utc": now_utc.isoformat(),
+        "script": str(Path(__file__).resolve()),
+        "command": " ".join(shlex.quote(x) for x in sys.argv),
+        "cwd": str(Path.cwd()),
+        "hostname": socket.gethostname(),
+        "user": getpass.getuser(),
+        "platform": platform.platform(),
+        "python_version": sys.version,
+        "git_commit": _safe_git_commit(),
+        "args": _jsonable_args(args),
+        "torch": {
+            "version": torch.__version__,
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_version": torch.version.cuda,
+        },
+    }
+
+
+def archive_run_record(args: argparse.Namespace, summary_obj: Dict[str, object], script_name: str) -> Path | None:
+    if args.disable_archive:
+        return None
+
+    archive_root = args.archive_dir.expanduser().resolve()
+    archive_dir = archive_root / script_name
+    ensure_dir(archive_dir)
+
+    run_id = str(summary_obj["run_meta"]["run_id"])
+    tag = f"_{args.archive_tag.strip()}" if args.archive_tag.strip() else ""
+    archive_path = archive_dir / f"{run_id}{tag}.json"
+    with open(archive_path, "w", encoding="utf-8") as f:
+        json.dump(summary_obj, f, ensure_ascii=False, indent=2)
+    return archive_path
 
 
 def load_classifier(name: str, device: torch.device) -> torch.nn.Module:
@@ -307,12 +394,14 @@ def save_purify_trace(sample_dir: Path, t_star: int, trace: Dict[str, object], x
     x_t = trace["x_t"]
     x0_hat = trace["x0_hat"]
     ll_hat = trace["ll_hat"]
+    ll_anchor = trace["ll_anchor"]
     hf_hat = trace["hf_hat"]
     hf_selected = trace["hf_selected"]
 
     save_tensor_image(x_t[0].clamp(0.0, 1.0), sample_dir / f"03_x_t{t_star}.png")
     save_tensor_image(x0_hat[0], sample_dir / "04_x0_hat.png")
     save_tensor_image(ll_hat.clamp(0.0, 1.0), sample_dir / "05_LL_hat.png")
+    save_tensor_image(ll_anchor.clamp(0.0, 1.0), sample_dir / "05_LL_anchor.png")
     save_tensor_image(coeff_to_vis(hf_hat["HL"]), sample_dir / "05_HL_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["LH"]), sample_dir / "05_LH_hat_vis.png")
     save_tensor_image(coeff_to_vis(hf_hat["HH"]), sample_dir / "05_HH_hat_vis.png")
@@ -444,6 +533,8 @@ def main() -> None:
             hf_shrink=args.hf_shrink,
             replacement_mode=args.replacement_mode,
             predictor_image_size=args.predictor_image_size,
+            ablation_ll_source=args.ablation_ll_source,
+            ablation_hard_hf_source=args.ablation_hard_hf_source,
         )
         save_purify_trace(sample_dir, args.t_star, trace, x_corrected, x_final)
 
@@ -485,6 +576,8 @@ def main() -> None:
                 "predictor_type": args.predictor_type,
                 "predictor_image_size": args.predictor_image_size,
                 "replacement_mode": args.replacement_mode,
+                "ablation_ll_source": args.ablation_ll_source,
+                "ablation_hard_hf_source": args.ablation_hard_hf_source,
                 "hf_preserve": args.hf_preserve,
                 "hf_shrink": args.hf_shrink,
             },
@@ -531,6 +624,7 @@ def main() -> None:
     }
 
     summary = {
+        "run_meta": build_run_meta(args),
         "aggregate": aggregate,
         "samples": per_sample,
     }
@@ -538,9 +632,12 @@ def main() -> None:
     summary_path = args.output_dir / "summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+    archive_path = archive_run_record(args, summary, script_name="wgcp_attack_eval")
 
     print(f"Done. Results saved to: {args.output_dir}")
     print(f"Summary: {summary_path}")
+    if archive_path is not None:
+        print(f"Archived summary: {archive_path}")
 
 
 if __name__ == "__main__":

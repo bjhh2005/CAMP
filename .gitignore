@@ -212,6 +212,8 @@ models/
 *.pth
 third_party/ctm/
 configs/ctm_server_config.json
+.camp_runs/
+run_archive/
 
 # Marimo
 marimo/_static/
