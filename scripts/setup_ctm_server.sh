@@ -31,7 +31,11 @@ fi
 echo "[4/6] Download CTM checkpoint (ImageNet64)"
 CKPT_PATH="$CTM_CACHE_DIR/ctm_imagenet64_ema999.pt"
 if [ ! -f "$CKPT_PATH" ]; then
-  conda run -n "$CAMP_ENV" python -m gdown --id "$CTM_IMAGENET64_CKPT_ID" -O "$CKPT_PATH"
+  FILE_URL="https://drive.google.com/uc?id=$CTM_IMAGENET64_CKPT_ID"
+  if ! conda run -n "$CAMP_ENV" python -m gdown "$FILE_URL" -O "$CKPT_PATH"; then
+    echo "gdown URL mode failed, retry with raw ID mode..."
+    conda run -n "$CAMP_ENV" python -m gdown "$CTM_IMAGENET64_CKPT_ID" -O "$CKPT_PATH"
+  fi
 else
   echo "Checkpoint already exists: $CKPT_PATH"
 fi
