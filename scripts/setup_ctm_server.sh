@@ -12,11 +12,13 @@ CTM_CHECKPOINT_PATH="${CTM_CHECKPOINT_PATH:-}"
 DOWNLOAD_CKPT="${DOWNLOAD_CKPT:-0}"
 DOWNLOAD_FOLDER="${DOWNLOAD_FOLDER:-0}"
 INSTALL_CTM_REQS="${INSTALL_CTM_REQS:-1}"
+INSTALL_CTM_RUNTIME_REQS="${INSTALL_CTM_RUNTIME_REQS:-1}"
+CTM_RUNTIME_PIP_PKGS="${CTM_RUNTIME_PIP_PKGS:-blobfile einops mpi4py}"
 
 mkdir -p "$CTM_CACHE_DIR"
 mkdir -p "$(dirname "$CTM_REPO_DIR")"
 
-echo "[1/6] Update CAMP conda env: $CAMP_ENV"
+echo "[1/7] Update CAMP conda env: $CAMP_ENV"
 conda env update -n "$CAMP_ENV" -f "$ROOT_DIR/environment.yml" --prune
 
 NEED_GDOWN=0
@@ -24,7 +26,7 @@ if [ "$DOWNLOAD_CKPT" = "1" ] || [ "$DOWNLOAD_FOLDER" = "1" ]; then
   NEED_GDOWN=1
 fi
 
-echo "[2/6] Prepare download helper (optional)"
+echo "[2/7] Prepare download helper (optional)"
 if [ "$NEED_GDOWN" = "1" ]; then
   echo "Installing gdown in $CAMP_ENV ..."
   conda run -n "$CAMP_ENV" python -m pip install --upgrade gdown
@@ -32,7 +34,7 @@ else
   echo "Skip gdown install (manual checkpoint mode)."
 fi
 
-echo "[3/6] Clone or update CTM repo"
+echo "[3/7] Clone or update CTM repo"
 if [ -d "$CTM_REPO_DIR/.git" ]; then
   git -C "$CTM_REPO_DIR" fetch --all --tags
   git -C "$CTM_REPO_DIR" pull --ff-only
@@ -40,7 +42,15 @@ else
   git clone "$CTM_REPO_URL" "$CTM_REPO_DIR"
 fi
 
-echo "[4/6] Resolve CTM checkpoint"
+echo "[4/7] Install CTM runtime Python deps (project-level)"
+if [ "$INSTALL_CTM_RUNTIME_REQS" = "1" ]; then
+  # These are the most common missing runtime deps when importing sony/ctm modules.
+  conda run -n "$CAMP_ENV" python -m pip install $CTM_RUNTIME_PIP_PKGS
+else
+  echo "Skip CTM runtime deps install."
+fi
+
+echo "[5/7] Resolve CTM checkpoint"
 CKPT_PATH=""
 if [ -n "$CTM_CHECKPOINT_PATH" ]; then
   if [ ! -f "$CTM_CHECKPOINT_PATH" ]; then
@@ -77,7 +87,7 @@ if [ "$DOWNLOAD_FOLDER" = "1" ]; then
   conda run -n "$CAMP_ENV" python -m gdown --folder "https://drive.google.com/drive/folders/$CTM_CHECKPOINTS_FOLDER_ID" -O "$CTM_CACHE_DIR/author_folder"
 fi
 
-echo "[5/6] Optionally install CTM repo requirements"
+echo "[6/7] Optionally install CTM repo requirements"
 if [ "$INSTALL_CTM_REQS" = "1" ]; then
   if [ -f "$CTM_REPO_DIR/requirements.txt" ]; then
     conda run -n "$CAMP_ENV" python -m pip install -r "$CTM_REPO_DIR/requirements.txt"
@@ -86,7 +96,7 @@ if [ "$INSTALL_CTM_REQS" = "1" ]; then
   fi
 fi
 
-echo "[6/6] Write local CTM config"
+echo "[7/7] Write local CTM config"
 mkdir -p "$ROOT_DIR/configs"
 cat > "$ROOT_DIR/configs/ctm_server_config.json" <<EOF
 {

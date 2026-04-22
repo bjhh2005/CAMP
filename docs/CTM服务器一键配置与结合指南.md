@@ -10,11 +10,12 @@ bash scripts/setup_ctm_server.sh
 这个脚本会做：
 
 1. 用 `environment.yml` 更新 `camp` conda 环境。
-2. 安装 `gdown`。
+2. 按需安装 `gdown`（仅下载模式需要）。
 3. 拉取/更新官方 CTM 仓库（`third_party/ctm`）。
 4. 解析 checkpoint 路径（优先手动提供，其次本地已有文件，最后才可选下载）。
-5. 安装 CTM 依赖（默认开启）。
-6. 生成 `configs/ctm_server_config.json`。
+5. 安装 CTM 运行时依赖（默认：`blobfile einops mpi4py`）。
+6. 安装 CTM 仓库 requirements（默认开启）。
+7. 生成 `configs/ctm_server_config.json`。
 
 可选环境变量：
 
@@ -25,6 +26,7 @@ CTM_CACHE_DIR=/data/model_cache/ctm \
 CTM_CHECKPOINT_PATH=/data/model_cache/ctm/ema_0.999_049000.pt \
 DOWNLOAD_CKPT=0 \
 DOWNLOAD_FOLDER=0 \
+INSTALL_CTM_RUNTIME_REQS=1 \
 INSTALL_CTM_REQS=1 \
 bash scripts/setup_ctm_server.sh
 ```
@@ -42,6 +44,9 @@ bash scripts/setup_ctm_server.sh
 2. `$CTM_CACHE_DIR/ctm_imagenet64_ema999.pt`
 3. `$CTM_CACHE_DIR/ema_0.999_049000.pt`
 4. 仅当 `DOWNLOAD_CKPT=1` 时才尝试联网下载
+
+说明：项目已内置 `flash_attn`/`xformers` 的 Python fallback shim，避免服务器上编译 `flash-attn` 失败导致流程中断。
+说明：`run_wgcp_ctm_server.sh` 会自动设置 `PYTHONPATH`，你不需要再手动 `export PYTHONPATH=...`。
 
 ## 2. 为什么 CTM 直接用于净化会不稳
 
