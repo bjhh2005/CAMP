@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 export PYTHONPATH="$ROOT_DIR/experiments:$ROOT_DIR:${PYTHONPATH:-}"
 
 CONFIG_PATH="${CAMP_CTM_CONFIG:-$ROOT_DIR/configs/ctm_server_config.json}"
-INPUT_DIR="${1:-$ROOT_DIR/data/clean_samples}"
+INPUT_DIR="${1:-$ROOT_DIR/data/imagenet_real}"
 OUTPUT_ROOT="${2:-$ROOT_DIR/outputs/wgcp_ablation_ctm}"
 shift $(( $# >= 2 ? 2 : $# ))
 EXTRA_ARGS=("$@")
@@ -26,10 +26,11 @@ PREDICTOR_IMAGE_SIZE="$(python -c "import json;print(json.load(open(r'$CONFIG_PA
 CLASS_COND="${CTM_CLASS_COND:-1}"
 CLASS_LABEL="${CTM_CLASS_LABEL:-0}"
 TORCH_CACHE="${TORCH_CACHE_DIR:-$ROOT_DIR/.cache/torch}"
-MAX_IMAGES="${MAX_IMAGES:-8}"
+MAX_IMAGES="${MAX_IMAGES:-100}"
 MIN_CLEAN_CONF="${MIN_CLEAN_CONF:-0.05}"
 HF_PRESERVE="${HF_PRESERVE:-0.35}"
 HF_SHRINK="${HF_SHRINK:-0.6}"
+GLOB_PATTERN="${GLOB_PATTERN:-*.JPEG}"
 
 PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE')}))")"
 
@@ -37,6 +38,7 @@ echo "Running WGCP+CTM ablation suite"
 echo "  env: $CAMP_ENV"
 echo "  input: $INPUT_DIR"
 echo "  output root: $OUTPUT_ROOT"
+echo "  glob: $GLOB_PATTERN"
 echo "  ctm repo: $CTM_REPO"
 echo "  ckpt: $CTM_CKPT"
 
@@ -62,6 +64,7 @@ run_case() {
     --predictor_kwargs_json "$PREDICTOR_KWARGS" \
     --predictor_image_size "$PREDICTOR_IMAGE_SIZE" \
     --max_images "$MAX_IMAGES" \
+    --glob "$GLOB_PATTERN" \
     --min_clean_conf "$MIN_CLEAN_CONF" \
     --archive_tag "ablation_${case_name}" \
     "${EXTRA_ARGS[@]}" \

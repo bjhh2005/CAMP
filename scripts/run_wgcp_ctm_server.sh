@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 export PYTHONPATH="$ROOT_DIR/experiments:$ROOT_DIR:${PYTHONPATH:-}"
 CONFIG_PATH="${CAMP_CTM_CONFIG:-$ROOT_DIR/configs/ctm_server_config.json}"
-INPUT_DIR="${1:-$ROOT_DIR/data/clean_samples}"
+INPUT_DIR="${1:-$ROOT_DIR/data/imagenet_real}"
 OUTPUT_DIR="${2:-$ROOT_DIR/outputs/wgcp_eval_ctm}"
 shift $(( $# >= 2 ? 2 : $# ))
 
@@ -24,6 +24,7 @@ PREDICTOR_IMAGE_SIZE="$(python -c "import json;print(json.load(open(r'$CONFIG_PA
 CLASS_COND="${CTM_CLASS_COND:-1}"
 CLASS_LABEL="${CTM_CLASS_LABEL:-0}"
 TORCH_CACHE="${TORCH_CACHE_DIR:-$ROOT_DIR/.cache/torch}"
+GLOB_PATTERN="${GLOB_PATTERN:-*.JPEG}"
 
 PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE')}))")"
 
@@ -31,6 +32,7 @@ echo "Running WGCP+CTM eval"
 echo "  env: $CAMP_ENV"
 echo "  input: $INPUT_DIR"
 echo "  output: $OUTPUT_DIR"
+echo "  glob: $GLOB_PATTERN"
 echo "  ctm repo: $CTM_REPO"
 echo "  ckpt: $CTM_CKPT"
 
@@ -50,6 +52,7 @@ PY
 
 conda run -n "$CAMP_ENV" python "$ROOT_DIR/experiments/wgcp_attack_eval.py" \
   --input_dir "$INPUT_DIR" \
+  --glob "$GLOB_PATTERN" \
   --output_dir "$OUTPUT_DIR" \
   --attack pgd \
   --eps 0.0313725 \

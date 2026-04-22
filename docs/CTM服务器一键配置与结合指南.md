@@ -78,13 +78,15 @@ bash scripts/setup_ctm_server.sh
 
 ```bash
 cd /path/to/CAMP
-bash scripts/run_wgcp_ctm_server.sh /path/to/clean_samples /path/to/outputs/wgcp_eval_ctm
+GLOB_PATTERN="*.JPEG" \
+bash scripts/run_wgcp_ctm_server.sh /path/to/imagenet_real /path/to/outputs/wgcp_eval_ctm
 ```
 
 如需一次性跑完整消融矩阵（A0-A5）：
 
 ```bash
-bash scripts/run_ablation_ctm_server.sh /path/to/clean_samples /path/to/outputs/wgcp_ablation_ctm
+GLOB_PATTERN="*.JPEG" MAX_IMAGES=100 \
+bash scripts/run_ablation_ctm_server.sh /path/to/imagenet_real /path/to/outputs/wgcp_ablation_ctm
 ```
 
 详细解释见：`docs/消融实验方案.md`
@@ -95,7 +97,8 @@ bash scripts/run_ablation_ctm_server.sh /path/to/clean_samples /path/to/outputs/
 CTM_CLASS_COND=1 \
 CTM_CLASS_LABEL=0 \
 TORCH_CACHE_DIR=/data/model_cache/camp_torch \
-bash scripts/run_wgcp_ctm_server.sh /data/clean_samples /data/outputs/wgcp_eval_ctm
+GLOB_PATTERN="*.JPEG" \
+bash scripts/run_wgcp_ctm_server.sh /data/imagenet_real /data/outputs/wgcp_eval_ctm
 ```
 
 归档说明：
@@ -111,7 +114,8 @@ bash scripts/run_wgcp_ctm_server.sh /data/clean_samples /data/outputs/wgcp_eval_
 
 ```bash
 python experiments/wgcp_attack_eval.py \
-  --input_dir data/clean_samples \
+  --input_dir data/imagenet_real \
+  --glob "*.JPEG" \
   --output_dir outputs/wgcp_eval_ctm \
   --attack pgd \
   --eps 0.0313725 \
