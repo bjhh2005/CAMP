@@ -1,6 +1,7 @@
 name: camp
 channels:
   - pytorch
+  - nvidia
   - conda-forge
   - defaults
 dependencies:
@@ -12,4 +13,9 @@ dependencies:
   - tqdm>=4.66
   - pytorch>=2.1
   - torchvision>=0.16
+  - pytorch-cuda=12.1
   - pip
+  - pip:
+    - blobfile
+    - einops
+    # - flash-attn  # 建议先注释掉，等 Torch 跑通后再手动装
