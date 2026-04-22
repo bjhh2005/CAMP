@@ -79,6 +79,9 @@ bash scripts/setup_ctm_server.sh
 ```bash
 cd /path/to/CAMP
 GLOB_PATTERN="*.JPEG" \
+MAX_IMAGES=100 \
+LIGHTWEIGHT_MODE=1 \
+SAVE_REFERENCE_EVERY=10 \
 bash scripts/run_wgcp_ctm_server.sh /path/to/imagenet_real /path/to/outputs/wgcp_eval_ctm
 ```
 
@@ -98,6 +101,9 @@ CTM_CLASS_COND=1 \
 CTM_CLASS_LABEL=0 \
 TORCH_CACHE_DIR=/data/model_cache/camp_torch \
 GLOB_PATTERN="*.JPEG" \
+MAX_IMAGES=100 \
+LIGHTWEIGHT_MODE=1 \
+SAVE_REFERENCE_EVERY=10 \
 bash scripts/run_wgcp_ctm_server.sh /data/imagenet_real /data/outputs/wgcp_eval_ctm
 ```
 
@@ -128,16 +134,18 @@ python experiments/wgcp_attack_eval.py \
   --predictor_kwargs_json '{"ctm_repo":"/path/to/CAMP/third_party/ctm","checkpoint":"/path/to/CAMP/.cache/ctm/ctm_imagenet64_ema999.pt"}' \
   --predictor_image_size 64 \
   --t_star 40 \
-  --t_bridge 10 \
-  --self_correct_k 1 \
+  --self_correct_k 0 \
   --replacement_mode hard \
+  --lightweight_mode \
+  --save_reference_every 10 \
   --mix 0.35 \
   --min_clean_conf 0.05
 ```
 
 ## 6. 先做的最小实验建议
 
-1. 先固定 CAMP 主流程：`self_correct_k=1`，`replacement_mode=hard`。
-2. 先扫参数：`t_star in {20,30,40}`，`t_bridge in {5,10,15}`。
-3. 如细节损失大，再对照 `replacement_mode=fused` 并扫描：`hf_preserve in {0.3,0.45,0.6}`。
-4. 优先看 `recover_rate_on_attacked` 与 `clean_vs_purified.SSIM` 的折中，不要只看单指标。
+1. 基于当前冒烟结果，优先使用：`self_correct_k=0`，`replacement_mode=hard`。
+2. 先扫参数：`t_star in {20,30,40}`。
+3. 如要验证 loop 价值，再单独扫：`self_correct_k=1` 且 `t_bridge in {5,10,15}`。
+4. 如细节损失大，再对照 `replacement_mode=fused` 并扫描：`hf_preserve in {0.3,0.45,0.6}`。
+5. 优先看 `recover_rate_on_attacked` 与 `clean_vs_purified.SSIM` 的折中，不要只看单指标。

@@ -60,6 +60,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=Path, default=Path("outputs/wgcp_eval"))
     parser.add_argument("--max_images", type=int, default=8)
     parser.add_argument("--glob", type=str, default="*.png")
+    parser.add_argument(
+        "--lightweight_mode",
+        action="store_true",
+        help="Save only summary and sparse reference panels (no per-sample folders/metrics).",
+    )
+    parser.add_argument(
+        "--save_reference_every",
+        type=int,
+        default=10,
+        help="In lightweight mode, save one clean/adv/purified panel every N samples (<=0 disables reference images).",
+    )
+    parser.add_argument(
+        "--reference_dir",
+        type=Path,
+        default=None,
+        help="Optional reference image directory. Default: <output_dir>/references when lightweight_mode is on.",
+    )
     parser.add_argument("--resize", type=int, nargs=2, default=None, metavar=("H", "W"))
     parser.add_argument("--clf_resize_short", type=int, default=256, help="Classifier pre-resize short side")
     parser.add_argument("--clf_crop_size", type=int, default=224, help="Classifier center-crop size")
@@ -421,6 +438,10 @@ def save_purify_trace(sample_dir: Path, t_star: int, trace: Dict[str, object], x
     save_tensor_image(x_final[0], sample_dir / "08_x_final.png")
 
 
+def should_save_reference(index_1_based: int, every: int) -> bool:
+    return every > 0 and index_1_based % every == 0
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -452,10 +473,18 @@ def main() -> None:
     per_sample: List[Dict[str, object]] = []
     valid_sample_count = 0
     skipped_low_conf_count = 0
+    saved_reference_count = 0
 
-    for image_path in tqdm(image_paths, desc="WGCP attack+eval"):
+    reference_dir: Path | None = None
+    if args.lightweight_mode and args.save_reference_every > 0:
+        reference_dir = (args.reference_dir if args.reference_dir is not None else (args.output_dir / "references")).resolve()
+        ensure_dir(reference_dir)
+
+    for sample_idx, image_path in enumerate(tqdm(image_paths, desc="WGCP attack+eval"), start=1):
+        save_reference = args.lightweight_mode and should_save_reference(sample_idx, args.save_reference_every)
         sample_dir = args.output_dir / image_path.stem
-        ensure_dir(sample_dir)
+        if not args.lightweight_mode:
+            ensure_dir(sample_dir)
 
         clean_img = Image.open(image_path).convert("RGB")
         if args.resize is not None:
@@ -463,7 +492,8 @@ def main() -> None:
             clean_img = clean_img.resize((w, h), Image.BICUBIC)
 
         x_clean = pil_to_tensor(clean_img).unsqueeze(0).to(device)
-        save_tensor_image(x_clean[0], sample_dir / "00_x_clean.png")
+        if not args.lightweight_mode:
+            save_tensor_image(x_clean[0], sample_dir / "00_x_clean.png")
 
         pred_clean, conf_clean = classify(
             classifier,
@@ -485,8 +515,9 @@ def main() -> None:
                     "clean_conf": float(conf_clean.item()),
                 },
             }
-            with open(sample_dir / "metrics.json", "w", encoding="utf-8") as f:
-                json.dump(record, f, ensure_ascii=False, indent=2)
+            if not args.lightweight_mode:
+                with open(sample_dir / "metrics.json", "w", encoding="utf-8") as f:
+                    json.dump(record, f, ensure_ascii=False, indent=2)
             per_sample.append(record)
             continue
 
@@ -514,7 +545,8 @@ def main() -> None:
                 crop_size=args.clf_crop_size,
             )
 
-        save_tensor_image(x_adv[0], sample_dir / "01_x_adv.png")
+        if not args.lightweight_mode:
+            save_tensor_image(x_adv[0], sample_dir / "01_x_adv.png")
         pred_adv, conf_adv = classify(
             classifier,
             x_adv,
@@ -536,7 +568,8 @@ def main() -> None:
             ablation_ll_source=args.ablation_ll_source,
             ablation_hard_hf_source=args.ablation_hard_hf_source,
         )
-        save_purify_trace(sample_dir, args.t_star, trace, x_corrected, x_final)
+        if not args.lightweight_mode:
+            save_purify_trace(sample_dir, args.t_star, trace, x_corrected, x_final)
 
         pred_final, conf_final = classify(
             classifier,
@@ -545,11 +578,17 @@ def main() -> None:
             crop_size=args.clf_crop_size,
         )
 
-        panel_clean_adv_final = make_triplet_panel([x_clean[0], x_adv[0], x_final[0]])
-        panel_clean_adv_final.save(sample_dir / "09_compare_clean_adv_final.png")
+        if not args.lightweight_mode:
+            panel_clean_adv_final = make_triplet_panel([x_clean[0], x_adv[0], x_final[0]])
+            panel_clean_adv_final.save(sample_dir / "09_compare_clean_adv_final.png")
 
-        panel_adv_corrected_final = make_triplet_panel([x_adv[0], x_corrected[0], x_final[0]])
-        panel_adv_corrected_final.save(sample_dir / "10_compare_adv_corrected_final.png")
+            panel_adv_corrected_final = make_triplet_panel([x_adv[0], x_corrected[0], x_final[0]])
+            panel_adv_corrected_final.save(sample_dir / "10_compare_adv_corrected_final.png")
+        elif save_reference and reference_dir is not None:
+            panel_clean_adv_final = make_triplet_panel([x_clean[0], x_adv[0], x_final[0]])
+            ref_name = f"{sample_idx:04d}_{image_path.stem}_clean_adv_final.png"
+            panel_clean_adv_final.save(reference_dir / ref_name)
+            saved_reference_count += 1
 
         metrics_clean_adv = compute_metrics(x_clean[0], x_adv[0])
         metrics_clean_purified = compute_metrics(x_clean[0], x_final[0])
@@ -597,8 +636,9 @@ def main() -> None:
             },
         }
 
-        with open(sample_dir / "metrics.json", "w", encoding="utf-8") as f:
-            json.dump(record, f, ensure_ascii=False, indent=2)
+        if not args.lightweight_mode:
+            with open(sample_dir / "metrics.json", "w", encoding="utf-8") as f:
+                json.dump(record, f, ensure_ascii=False, indent=2)
 
         per_sample.append(record)
 
@@ -620,6 +660,10 @@ def main() -> None:
         "attack_success_rate": attacked / max(1, valid_sample_count),
         "recover_rate_on_attacked": recovered / max(1, attacked),
         "clean_pred_consistency_rate": overall_consistent / max(1, valid_sample_count),
+        "lightweight_mode": bool(args.lightweight_mode),
+        "save_reference_every": int(args.save_reference_every),
+        "saved_reference_images": int(saved_reference_count),
+        "reference_dir": str(reference_dir) if reference_dir is not None else None,
         "note": "This script uses clean-image predicted label as pseudo-label (no ground-truth required). Low-confidence clean samples can be skipped.",
     }
 
