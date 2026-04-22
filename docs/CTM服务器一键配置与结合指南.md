@@ -46,6 +46,7 @@ bash scripts/setup_ctm_server.sh
 4. 仅当 `DOWNLOAD_CKPT=1` 时才尝试联网下载
 
 说明：项目已内置 `flash_attn`/`xformers` 的 Python fallback shim，避免服务器上编译 `flash-attn` 失败导致流程中断。
+说明：因此不建议在服务器手工 `pip install flash_attn`（常见编译失败），直接用本项目 fallback 更稳。
 说明：`run_wgcp_ctm_server.sh` 会自动设置 `PYTHONPATH`，你不需要再手动 `export PYTHONPATH=...`。
 
 ## 2. 为什么 CTM 直接用于净化会不稳
