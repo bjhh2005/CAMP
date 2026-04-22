@@ -34,6 +34,20 @@ echo "  output: $OUTPUT_DIR"
 echo "  ctm repo: $CTM_REPO"
 echo "  ckpt: $CTM_CKPT"
 
+echo "Preflight import check (flash_attn/xformers shims)..."
+conda run -n "$CAMP_ENV" python - <<'PY'
+import importlib
+mods = [
+    "flash_attn.flash_attn_interface",
+    "flash_attn.bert_padding",
+    "xformers.ops",
+    "xformers.components.attention",
+]
+for m in mods:
+    importlib.import_module(m)
+print("shim import check: OK")
+PY
+
 conda run -n "$CAMP_ENV" python "$ROOT_DIR/experiments/wgcp_attack_eval.py" \
   --input_dir "$INPUT_DIR" \
   --output_dir "$OUTPUT_DIR" \
