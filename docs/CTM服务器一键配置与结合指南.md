@@ -12,7 +12,7 @@ bash scripts/setup_ctm_server.sh
 1. 用 `environment.yml` 更新 `camp` conda 环境。
 2. 安装 `gdown`。
 3. 拉取/更新官方 CTM 仓库（`third_party/ctm`）。
-4. 下载官方 ImageNet64 CTM checkpoint 到 `.cache/ctm/`。
+4. 解析 checkpoint 路径（优先手动提供，其次本地已有文件，最后才可选下载）。
 5. 安装 CTM 依赖（默认开启）。
 6. 生成 `configs/ctm_server_config.json`。
 
@@ -22,10 +22,26 @@ bash scripts/setup_ctm_server.sh
 CAMP_ENV=camp \
 CTM_REPO_DIR=/data/repos/ctm \
 CTM_CACHE_DIR=/data/model_cache/ctm \
-DOWNLOAD_FOLDER=1 \
+CTM_CHECKPOINT_PATH=/data/model_cache/ctm/ema_0.999_049000.pt \
+DOWNLOAD_CKPT=0 \
+DOWNLOAD_FOLDER=0 \
 INSTALL_CTM_REQS=1 \
 bash scripts/setup_ctm_server.sh
 ```
+
+如果你手动下载了 `ema_0.999_049000.pt`，推荐直接这样执行（不会触发 Google Drive 下载）：
+
+```bash
+CTM_CHECKPOINT_PATH=/home/HHY/models/ema_0.999_049000.pt \
+DOWNLOAD_CKPT=0 \
+bash scripts/setup_ctm_server.sh
+```
+
+脚本会在以下优先级选择 checkpoint：
+1. `CTM_CHECKPOINT_PATH`
+2. `$CTM_CACHE_DIR/ctm_imagenet64_ema999.pt`
+3. `$CTM_CACHE_DIR/ema_0.999_049000.pt`
+4. 仅当 `DOWNLOAD_CKPT=1` 时才尝试联网下载
 
 ## 2. 为什么 CTM 直接用于净化会不稳
 
