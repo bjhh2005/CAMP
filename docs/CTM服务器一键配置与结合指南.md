@@ -1,151 +1,111 @@
 # CTM 服务器一键配置与 WGCP 结合指南
 
-## 1. 仅服务器执行（不在 Windows 本地配置 CTM）
+## 1. 适用范围
+
+这份文档只针对 Linux 服务器场景（建议在服务器端完成全部 CTM 相关操作）。
+
+## 2. 一次性配置（setup）
+
+在仓库根目录执行：
 
 ```bash
-cd /path/to/CAMP
 bash scripts/setup_ctm_server.sh
 ```
 
-这个脚本会做：
+脚本会完成：
 
-1. 用 `environment.yml` 更新 `camp` conda 环境。
-2. 按需安装 `gdown`（仅下载模式需要）。
-3. 拉取/更新官方 CTM 仓库（`third_party/ctm`）。
-4. 解析 checkpoint 路径（优先手动提供，其次本地已有文件，最后才可选下载）。
-5. 安装 CTM 运行时依赖（默认：`blobfile einops mpi4py`）。
-6. 安装 CTM 仓库 requirements（默认开启）。
-7. 生成 `configs/ctm_server_config.json`。
+1. 更新 `camp` conda 环境（`environment.yml`）。
+2. 拉取或更新 `third_party/ctm`。
+3. 解析并检查 checkpoint 路径。
+4. 安装 CTM 运行时依赖和仓库 requirements（可通过环境变量关闭）。
+5. 生成 `configs/ctm_server_config.json`。
 
-可选环境变量：
+手动 checkpoint（推荐，避免在线下载波动）：
 
 ```bash
-CAMP_ENV=camp \
-CTM_REPO_DIR=/data/repos/ctm \
-CTM_CACHE_DIR=/data/model_cache/ctm \
-CTM_CHECKPOINT_PATH=/data/model_cache/ctm/ema_0.999_049000.pt \
-DOWNLOAD_CKPT=0 \
-DOWNLOAD_FOLDER=0 \
-INSTALL_CTM_RUNTIME_REQS=1 \
-INSTALL_CTM_REQS=1 \
-bash scripts/setup_ctm_server.sh
-```
-
-如果你手动下载了 `ema_0.999_049000.pt`，推荐直接这样执行（不会触发 Google Drive 下载）：
-
-```bash
-CTM_CHECKPOINT_PATH=/home/HHY/models/ema_0.999_049000.pt \
+CTM_CHECKPOINT_PATH=/home/you/models/ema_0.999_049000.pt \
 DOWNLOAD_CKPT=0 \
 bash scripts/setup_ctm_server.sh
 ```
 
-脚本会在以下优先级选择 checkpoint：
+checkpoint 选择优先级：
+
 1. `CTM_CHECKPOINT_PATH`
 2. `$CTM_CACHE_DIR/ctm_imagenet64_ema999.pt`
 3. `$CTM_CACHE_DIR/ema_0.999_049000.pt`
-4. 仅当 `DOWNLOAD_CKPT=1` 时才尝试联网下载
+4. 仅 `DOWNLOAD_CKPT=1` 时尝试下载
 
-说明：项目已内置 `flash_attn`/`xformers` 的 Python fallback shim，避免服务器上编译 `flash-attn` 失败导致流程中断。
-说明：因此不建议在服务器手工 `pip install flash_attn`（常见编译失败），直接用本项目 fallback 更稳。
-说明：`run_wgcp_ctm_server.sh` 会自动设置 `PYTHONPATH`，你不需要再手动 `export PYTHONPATH=...`。
-
-## 2. 为什么 CTM 直接用于净化会不稳
-
-你文档里的 WGCP 思路是对的：锁定低频 + 重写高频。问题在于公开 CTM 大多在生成数据集上训练（常见 64x64），并不是专门为了“输入一张被攻击图并恢复语义”。
-
-所以更稳妥的结合方式是（与你的 CAMP 文档一致）：
-
-1. 仍然锁定 `LL_orig`（语义锚点不变）。
-2. 让 CTM 只提供“高频先验”，不要接管低频语义。
-3. 默认采用 **硬替换**（`replacement_mode=hard`）：`IDWT(LL_orig, HF_hat)`。
-4. 通过中间重加噪（`t* -> t1 -> 0`）平滑拼接边界，这是 CAMP 的关键机制。
-5. 如果某些数据细节损失仍明显，再切到 `replacement_mode=fused` 做软融合。
-
-## 3. 项目里已经支持的结合接口
-
-现在脚本支持外部 predictor：
-
-- `--predictor_type module`
-- `--predictor_module package.module:ClassName`
-- `--predictor_kwargs_json '{...}'`
-- `--predictor_image_size 64`（适配 CTM-64）
-
-实际适配器（已接好 Sony CTM）：
-
-- `experiments/ctm_adapter_sony.py`
-
-## 4. 一键运行（服务器）
+## 3. 推荐主流程（非消融）
 
 ```bash
-cd /path/to/CAMP
 GLOB_PATTERN="*.JPEG" \
 MAX_IMAGES=100 \
 LIGHTWEIGHT_MODE=1 \
 SAVE_REFERENCE_EVERY=10 \
-bash scripts/run_wgcp_ctm_server.sh /path/to/imagenet_real /path/to/outputs/wgcp_eval_ctm
+bash scripts/run_wgcp_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_eval_ctm
 ```
 
-如需一次性跑完整消融矩阵（A0-A5）：
+当前脚本默认关键参数：
+
+- `self_correct_k=0`
+- `replacement_mode=hard`
+- `t_star=40`
+- `min_clean_conf=0.05`
+
+## 4. 一键消融（A0-A5）
 
 ```bash
 GLOB_PATTERN="*.JPEG" MAX_IMAGES=100 \
-bash scripts/run_ablation_ctm_server.sh /path/to/imagenet_real /path/to/outputs/wgcp_ablation_ctm
+bash scripts/run_ablation_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_ablation_ctm
 ```
 
-详细解释见：`docs/消融实验方案.md`
+详细矩阵与解读见：`docs/消融实验方案.md`。
 
-可选环境变量：
+## 5. tmux 长任务技巧（强烈建议）
+
+### 5.1 创建与恢复会话
 
 ```bash
-CTM_CLASS_COND=1 \
-CTM_CLASS_LABEL=0 \
-TORCH_CACHE_DIR=/data/model_cache/camp_torch \
-GLOB_PATTERN="*.JPEG" \
-MAX_IMAGES=100 \
-LIGHTWEIGHT_MODE=1 \
-SAVE_REFERENCE_EVERY=10 \
-bash scripts/run_wgcp_ctm_server.sh /data/imagenet_real /data/outputs/wgcp_eval_ctm
+# 新建会话
+tmux new -s camp_eval
+
+# 退出但不断任务：Ctrl+b 然后按 d
+
+# 查看会话
+tmux ls
+
+# 重新连接
+tmux attach -t camp_eval
+
+# 结束会话
+tmux kill-session -t camp_eval
 ```
 
-归档说明：
-
-- 每次运行都会把 `summary.json` 额外归档一份到仓库外默认目录：
-  `~/.camp_runs/CAMP/wgcp_attack_eval/<timestamp>.json`
-- 可选参数：
-  `--archive_dir /abs/path/to/archive_root`
-  `--archive_tag your_tag`
-  `--disable_archive`
-
-## 5. 手动运行命令（可选）
+### 5.2 分屏与监控
 
 ```bash
-python experiments/wgcp_attack_eval.py \
-  --input_dir data/imagenet_real \
-  --glob "*.JPEG" \
-  --output_dir outputs/wgcp_eval_ctm \
-  --attack pgd \
-  --eps 0.0313725 \
-  --pgd_steps 10 \
-  --pgd_alpha 0.0078431 \
-  --classifier resnet50 \
-  --weights_cache_dir /data/model_cache/camp_torch \
-  --predictor_type module \
-  --predictor_module experiments.ctm_adapter_sony:CTMRepoPredictor \
-  --predictor_kwargs_json '{"ctm_repo":"/path/to/CAMP/third_party/ctm","checkpoint":"/path/to/CAMP/.cache/ctm/ctm_imagenet64_ema999.pt"}' \
-  --predictor_image_size 64 \
-  --t_star 40 \
-  --self_correct_k 0 \
-  --replacement_mode hard \
-  --lightweight_mode \
-  --save_reference_every 10 \
-  --mix 0.35 \
-  --min_clean_conf 0.05
+# 水平分屏：Ctrl+b 然后按 "
+# 垂直分屏：Ctrl+b 然后按 %
+
+# 面板切换：Ctrl+b 然后按方向键
 ```
 
-## 6. 先做的最小实验建议
+推荐布局：
 
-1. 基于当前冒烟结果，优先使用：`self_correct_k=0`，`replacement_mode=hard`。
-2. 先扫参数：`t_star in {20,30,40}`。
-3. 如要验证 loop 价值，再单独扫：`self_correct_k=1` 且 `t_bridge in {5,10,15}`。
-4. 如细节损失大，再对照 `replacement_mode=fused` 并扫描：`hf_preserve in {0.3,0.45,0.6}`。
-5. 优先看 `recover_rate_on_attacked` 与 `clean_vs_purified.SSIM` 的折中，不要只看单指标。
+1. 左侧跑实验命令。
+2. 右侧 `watch -n 1 nvidia-smi` 监控显存和利用率。
+
+### 5.3 保存日志（排错必备）
+
+```bash
+mkdir -p logs
+bash scripts/run_wgcp_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_eval_ctm \
+  2>&1 | tee logs/wgcp_eval_$(date +%F_%H%M).log
+```
+
+## 6. 常见问题
+
+1. 提示缺少配置文件 `configs/ctm_server_config.json`：先执行 `bash scripts/setup_ctm_server.sh`。
+2. 首次下载分类器权重很慢：提前设置 `TORCH_CACHE_DIR` 指向高速磁盘。
+3. `flash_attn/xformers` 导入问题：本项目已有 fallback shim，通常不需要手工安装 `flash_attn`。
+4. 混合分辨率输入是否安全：流程支持混合分辨率；若做严格公平对比，仍建议在评估脚本中显式 `--resize H W`。

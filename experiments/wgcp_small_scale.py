@@ -261,7 +261,12 @@ def dwt2_rgb_tensor(x_chw: Tensor, wavelet: str) -> Tuple[Tensor, Dict[str, Tens
     return ll_t, hf
 
 
-def idwt2_rgb_tensor(ll_chw: Tensor, hf: Dict[str, Tensor], wavelet: str) -> Tensor:
+def idwt2_rgb_tensor(
+    ll_chw: Tensor,
+    hf: Dict[str, Tensor],
+    wavelet: str,
+    target_hw: Optional[Tuple[int, int]] = None,
+) -> Tensor:
     ll_np = ll_chw.detach().cpu().numpy()
     hl_np = hf["HL"].detach().cpu().numpy()
     lh_np = hf["LH"].detach().cpu().numpy()
@@ -272,6 +277,14 @@ def idwt2_rgb_tensor(ll_chw: Tensor, hf: Dict[str, Tensor], wavelet: str) -> Ten
         rec = pywt.idwt2((ll_np[c], (hl_np[c], lh_np[c], hh_np[c])), wavelet=wavelet, mode="periodization")
         rec_list.append(rec)
     rec_t = torch.from_numpy(np.stack(rec_list, axis=0)).float()
+    if target_hw is not None:
+        target_h, target_w = int(target_hw[0]), int(target_hw[1])
+        rec_t = rec_t[:, :target_h, :target_w]
+        cur_h, cur_w = rec_t.shape[-2], rec_t.shape[-1]
+        pad_h = max(0, target_h - cur_h)
+        pad_w = max(0, target_w - cur_w)
+        if pad_h > 0 or pad_w > 0:
+            rec_t = F.pad(rec_t, (0, pad_w, 0, pad_h), mode="replicate")
     return rec_t
 
 
@@ -450,6 +463,7 @@ def purify_adv_tensor(
     """
     if x_adv.ndim != 4 or x_adv.shape[0] != 1:
         raise ValueError("x_adv must have shape [1, C, H, W]")
+    target_hw = (int(x_adv.shape[-2]), int(x_adv.shape[-1]))
 
     ll_orig, hf_orig = dwt2_rgb_tensor(x_adv[0], wavelet=wavelet)
 
@@ -470,7 +484,7 @@ def purify_adv_tensor(
     else:
         raise ValueError(f"Unknown replacement_mode: {replacement_mode}")
 
-    x_corrected = idwt2_rgb_tensor(ll_anchor, hf_selected, wavelet=wavelet).to(x_adv.device).unsqueeze(0)
+    x_corrected = idwt2_rgb_tensor(ll_anchor, hf_selected, wavelet=wavelet, target_hw=target_hw).to(x_adv.device).unsqueeze(0)
     x_corrected = x_corrected.clamp(0.0, 1.0)
 
     current = x_corrected.clone()
@@ -485,7 +499,12 @@ def purify_adv_tensor(
             hf_k_selected = hf_k if ablation_hard_hf_source == "pred" else hf_orig
         else:
             hf_k_selected = fuse_high_frequency(hf_orig, hf_k, hf_preserve=hf_preserve, hf_shrink=hf_shrink)
-        current = idwt2_rgb_tensor(ll_anchor_k, hf_k_selected, wavelet=wavelet).to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
+        current = (
+            idwt2_rgb_tensor(ll_anchor_k, hf_k_selected, wavelet=wavelet, target_hw=target_hw)
+            .to(x_adv.device)
+            .unsqueeze(0)
+            .clamp(0.0, 1.0)
+        )
         loop_records.append(
             {
                 "t_step": t_step,
