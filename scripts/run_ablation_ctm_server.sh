@@ -32,6 +32,14 @@ HF_PRESERVE="${HF_PRESERVE:-0.35}"
 HF_SHRINK="${HF_SHRINK:-0.6}"
 GLOB_PATTERN="${GLOB_PATTERN:-*.JPEG}"
 SAVE_DETAIL_EVERY="${SAVE_DETAIL_EVERY:-10}"
+PATCH_MODE="${PATCH_MODE:-0}"
+PATCH_SIZE="${PATCH_SIZE:-64}"
+PATCH_STRIDE="${PATCH_STRIDE:-32}"
+PATCH_BATCH_SIZE="${PATCH_BATCH_SIZE:-64}"
+PATCH_WEIGHT_SIGMA="${PATCH_WEIGHT_SIGMA:-0}"
+PATCH_LOWFREQ_ALPHA="${PATCH_LOWFREQ_ALPHA:-0.1}"
+PATCH_LL_SOURCE="${PATCH_LL_SOURCE:-hat}"
+PATCH_PAD_MODE="${PATCH_PAD_MODE:-reflect}"
 
 PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE')}))")"
 
@@ -41,6 +49,7 @@ echo "  input: $INPUT_DIR"
 echo "  output root: $OUTPUT_ROOT"
 echo "  glob: $GLOB_PATTERN"
 echo "  save_detail_every: $SAVE_DETAIL_EVERY"
+echo "  patch_mode: $PATCH_MODE"
 echo "  ctm repo: $CTM_REPO"
 echo "  ckpt: $CTM_CKPT"
 
@@ -52,6 +61,20 @@ run_case() {
   local case_out="$OUTPUT_ROOT/$case_name"
   echo ""
   echo "==> [$case_name] output: $case_out"
+  local patch_args=()
+  if [ "$PATCH_MODE" = "1" ]; then
+    patch_args=(
+      --patch_mode
+      --patch_size "$PATCH_SIZE"
+      --patch_stride "$PATCH_STRIDE"
+      --patch_batch_size "$PATCH_BATCH_SIZE"
+      --patch_weight_sigma "$PATCH_WEIGHT_SIGMA"
+      --patch_lowfreq_alpha "$PATCH_LOWFREQ_ALPHA"
+      --patch_ll_source "$PATCH_LL_SOURCE"
+      --patch_pad_mode "$PATCH_PAD_MODE"
+    )
+  fi
+
   conda run -n "$CAMP_ENV" python "$ROOT_DIR/experiments/wgcp_attack_eval.py" \
     --input_dir "$INPUT_DIR" \
     --output_dir "$case_out" \
@@ -69,6 +92,7 @@ run_case() {
     --glob "$GLOB_PATTERN" \
     --min_clean_conf "$MIN_CLEAN_CONF" \
     --save_detail_every "$SAVE_DETAIL_EVERY" \
+    "${patch_args[@]}" \
     --archive_tag "ablation_${case_name}" \
     "${EXTRA_ARGS[@]}" \
     "$@"

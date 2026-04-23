@@ -112,6 +112,36 @@ def parse_args() -> argparse.Namespace:
         choices=["pred", "orig"],
         help="Ablation only under replacement_mode=hard: HF source. 'pred'=paper default, 'orig'=keep original HF.",
     )
+    parser.add_argument("--patch_mode", action="store_true", help="Enable Patch-WGCP purification pipeline.")
+    parser.add_argument("--patch_size", type=int, default=64, help="Patch size for Patch-WGCP.")
+    parser.add_argument("--patch_stride", type=int, default=32, help="Patch stride for Patch-WGCP.")
+    parser.add_argument("--patch_batch_size", type=int, default=64, help="Patch CTM inference batch size.")
+    parser.add_argument(
+        "--patch_weight_sigma",
+        type=float,
+        default=0.0,
+        help="Gaussian sigma (in pixels) for patch blending; <=0 means auto (patch_size/6).",
+    )
+    parser.add_argument(
+        "--patch_lowfreq_alpha",
+        type=float,
+        default=0.1,
+        help="Low-frequency blend weight between global-base and patch branch (0..1).",
+    )
+    parser.add_argument(
+        "--patch_ll_source",
+        type=str,
+        default="hat",
+        choices=["hat", "orig"],
+        help="LL source used inside each patch branch before folding.",
+    )
+    parser.add_argument(
+        "--patch_pad_mode",
+        type=str,
+        default="reflect",
+        choices=["reflect", "replicate", "constant"],
+        help="Padding mode used before unfold when shape is not divisible by patch stride.",
+    )
     parser.add_argument("--resize", type=int, nargs=2, default=None, metavar=("H", "W"))
     parser.add_argument(
         "--archive_dir",
@@ -342,6 +372,78 @@ def run_predictor(
     return predictor(x_t, t_index).clamp(0.0, 1.0)
 
 
+def compute_patch_padding(length: int, patch: int, stride: int) -> int:
+    if length <= patch:
+        return patch - length
+    rem = (length - patch) % stride
+    return 0 if rem == 0 else (stride - rem)
+
+
+def make_patch_gaussian_weight(
+    patch_size: int,
+    sigma_pixels: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    sigma = float(sigma_pixels) if sigma_pixels > 0 else max(1.0, float(patch_size) / 6.0)
+    coords = torch.arange(patch_size, device=device, dtype=dtype) - (patch_size - 1) / 2.0
+    g = torch.exp(-(coords**2) / (2.0 * sigma * sigma))
+    g2d = torch.outer(g, g)
+    g2d = g2d / g2d.max().clamp_min(1e-8)
+    return g2d.view(1, 1, patch_size, patch_size).clamp_min(1e-6)
+
+
+def unfold_patches(
+    x: Tensor,
+    patch_size: int,
+    stride: int,
+    pad_mode: str,
+) -> Tuple[Tensor, Tuple[int, int], Tuple[int, int]]:
+    if x.ndim != 4 or x.shape[0] != 1:
+        raise ValueError("unfold_patches expects x with shape [1, C, H, W]")
+    h, w = int(x.shape[-2]), int(x.shape[-1])
+    pad_h = compute_patch_padding(h, patch_size, stride)
+    pad_w = compute_patch_padding(w, patch_size, stride)
+    mode = pad_mode
+    if mode == "reflect" and (h <= 1 or w <= 1 or pad_h >= h or pad_w >= w):
+        mode = "replicate"
+    x_pad = F.pad(x, (0, pad_w, 0, pad_h), mode=mode)
+    h_pad, w_pad = int(x_pad.shape[-2]), int(x_pad.shape[-1])
+    cols = F.unfold(x_pad, kernel_size=patch_size, stride=stride)
+    # [1, C*K*K, L] -> [L, C, K, K]
+    l = int(cols.shape[-1])
+    c = int(x.shape[1])
+    patches = cols.squeeze(0).transpose(0, 1).contiguous().view(l, c, patch_size, patch_size)
+    return patches, (h_pad, w_pad), (pad_h, pad_w)
+
+
+def fold_patches_weighted(
+    patches: Tensor,
+    output_hw: Tuple[int, int],
+    patch_size: int,
+    stride: int,
+    weight_patch: Tensor,
+    target_hw: Tuple[int, int],
+) -> Tensor:
+    if patches.ndim != 4:
+        raise ValueError("fold_patches_weighted expects patches with shape [L, C, K, K]")
+    l, c, _, _ = patches.shape
+    weighted = patches * weight_patch
+    cols = weighted.reshape(l, c * patch_size * patch_size).transpose(0, 1).unsqueeze(0)
+    recon = F.fold(cols, output_size=output_hw, kernel_size=patch_size, stride=stride)
+
+    weight_cols = (
+        weight_patch.expand(l, 1, patch_size, patch_size)
+        .reshape(l, patch_size * patch_size)
+        .transpose(0, 1)
+        .unsqueeze(0)
+    )
+    weight_sum = F.fold(weight_cols, output_size=output_hw, kernel_size=patch_size, stride=stride).clamp_min(1e-6)
+    recon = recon / weight_sum.expand(1, c, output_hw[0], output_hw[1])
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    return recon[:, :, :target_h, :target_w].contiguous()
+
+
 def parse_steps(args: argparse.Namespace) -> List[int]:
     if args.self_correct_k <= 0:
         return []
@@ -442,7 +544,7 @@ def archive_run_record(args: argparse.Namespace, summary_obj: Dict[str, object],
     return archive_path
 
 
-def purify_adv_tensor(
+def _purify_adv_tensor_global(
     x_adv: Tensor,
     alpha_bars: Tensor,
     predictor,
@@ -456,11 +558,6 @@ def purify_adv_tensor(
     ablation_ll_source: str = "orig",
     ablation_hard_hf_source: str = "pred",
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
-    """
-    Purify one adversarial tensor with WGCP.
-    x_adv shape: [1, C, H, W]
-    Returns: (x_corrected, x_final, trace, single_step_infer_ms)
-    """
     if x_adv.ndim != 4 or x_adv.shape[0] != 1:
         raise ValueError("x_adv must have shape [1, C, H, W]")
     target_hw = (int(x_adv.shape[-2]), int(x_adv.shape[-1]))
@@ -531,8 +628,206 @@ def purify_adv_tensor(
             "ll_source": ablation_ll_source,
             "hard_hf_source": ablation_hard_hf_source,
         },
+        "predictor_calls": 1 + len(loop_steps),
     }
     return x_corrected, current, trace, infer_ms
+
+
+def purify_adv_tensor(
+    x_adv: Tensor,
+    alpha_bars: Tensor,
+    predictor,
+    wavelet: str,
+    t_star: int,
+    loop_steps: List[int],
+    hf_preserve: float = 0.35,
+    hf_shrink: float = 0.6,
+    replacement_mode: str = "hard",
+    predictor_image_size: int = 0,
+    ablation_ll_source: str = "orig",
+    ablation_hard_hf_source: str = "pred",
+    patch_mode: bool = False,
+    patch_size: int = 64,
+    patch_stride: int = 32,
+    patch_batch_size: int = 64,
+    patch_weight_sigma: float = 0.0,
+    patch_lowfreq_alpha: float = 0.1,
+    patch_ll_source: str = "hat",
+    patch_pad_mode: str = "reflect",
+) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
+    """
+    Purify one adversarial tensor with WGCP.
+    x_adv shape: [1, C, H, W]
+    Returns: (x_corrected, x_final, trace, single_step_infer_ms)
+    """
+    if not patch_mode:
+        return _purify_adv_tensor_global(
+            x_adv=x_adv,
+            alpha_bars=alpha_bars,
+            predictor=predictor,
+            wavelet=wavelet,
+            t_star=t_star,
+            loop_steps=loop_steps,
+            hf_preserve=hf_preserve,
+            hf_shrink=hf_shrink,
+            replacement_mode=replacement_mode,
+            predictor_image_size=predictor_image_size,
+            ablation_ll_source=ablation_ll_source,
+            ablation_hard_hf_source=ablation_hard_hf_source,
+        )
+
+    if x_adv.ndim != 4 or x_adv.shape[0] != 1:
+        raise ValueError("x_adv must have shape [1, C, H, W]")
+    if patch_size <= 1 or patch_stride <= 0 or patch_batch_size <= 0:
+        raise ValueError("patch_size/patch_stride/patch_batch_size must be positive")
+
+    target_hw = (int(x_adv.shape[-2]), int(x_adv.shape[-1]))
+    ll_orig, hf_orig = dwt2_rgb_tensor(x_adv[0], wavelet=wavelet)
+
+    # Global A5-style anchor branch.
+    x_base, _, base_trace, infer_base_ms = _purify_adv_tensor_global(
+        x_adv=x_adv,
+        alpha_bars=alpha_bars,
+        predictor=predictor,
+        wavelet=wavelet,
+        t_star=t_star,
+        loop_steps=[],
+        hf_preserve=hf_preserve,
+        hf_shrink=hf_shrink,
+        replacement_mode=replacement_mode,
+        predictor_image_size=predictor_image_size,
+        ablation_ll_source=ablation_ll_source,
+        ablation_hard_hf_source=ablation_hard_hf_source,
+    )
+
+    alpha_t = float(alpha_bars[t_star].item())
+    patches_adv, output_hw, _ = unfold_patches(
+        x_adv, patch_size=patch_size, stride=patch_stride, pad_mode=patch_pad_mode
+    )
+    num_patches = int(patches_adv.shape[0])
+
+    patch_outputs: List[Tensor] = []
+    infer_patch_ms = 0.0
+    for start in range(0, num_patches, patch_batch_size):
+        end = min(num_patches, start + patch_batch_size)
+        batch_adv = patches_adv[start:end].to(x_adv.device)
+        batch_t = add_noise(batch_adv, alpha_t)
+        t0 = time.perf_counter()
+        batch_hat = run_predictor(predictor, batch_t, t_star, predictor_image_size=predictor_image_size)
+        infer_patch_ms += (time.perf_counter() - t0) * 1000.0
+
+        rec_batch: List[Tensor] = []
+        for idx in range(int(batch_adv.shape[0])):
+            ll_p_orig, hf_p_orig = dwt2_rgb_tensor(batch_adv[idx], wavelet=wavelet)
+            ll_p_hat, hf_p_hat = dwt2_rgb_tensor(batch_hat[idx], wavelet=wavelet)
+            ll_p_anchor = ll_p_hat if patch_ll_source == "hat" else ll_p_orig
+
+            if replacement_mode == "hard":
+                hf_p_selected = hf_p_hat if ablation_hard_hf_source == "pred" else hf_p_orig
+            elif replacement_mode == "fused":
+                hf_p_selected = fuse_high_frequency(
+                    hf_p_orig, hf_p_hat, hf_preserve=hf_preserve, hf_shrink=hf_shrink
+                )
+            else:
+                raise ValueError(f"Unknown replacement_mode: {replacement_mode}")
+
+            rec_p = idwt2_rgb_tensor(
+                ll_p_anchor,
+                hf_p_selected,
+                wavelet=wavelet,
+                target_hw=(patch_size, patch_size),
+            )
+            rec_batch.append(rec_p.to(x_adv.device))
+        patch_outputs.append(torch.stack(rec_batch, dim=0))
+
+    patches_clean = torch.cat(patch_outputs, dim=0)
+    weight_patch = make_patch_gaussian_weight(
+        patch_size=patch_size,
+        sigma_pixels=patch_weight_sigma,
+        device=x_adv.device,
+        dtype=x_adv.dtype,
+    )
+    x_patch = fold_patches_weighted(
+        patches=patches_clean,
+        output_hw=output_hw,
+        patch_size=patch_size,
+        stride=patch_stride,
+        weight_patch=weight_patch,
+        target_hw=target_hw,
+    ).clamp(0.0, 1.0)
+
+    ll_base, _ = dwt2_rgb_tensor(x_base[0], wavelet=wavelet)
+    ll_patch, hf_patch = dwt2_rgb_tensor(x_patch[0], wavelet=wavelet)
+    alpha_mix = float(np.clip(patch_lowfreq_alpha, 0.0, 1.0))
+    ll_anchor = (1.0 - alpha_mix) * ll_base + alpha_mix * ll_patch
+    x_corrected = (
+        idwt2_rgb_tensor(ll_anchor, hf_patch, wavelet=wavelet, target_hw=target_hw)
+        .to(x_adv.device)
+        .unsqueeze(0)
+        .clamp(0.0, 1.0)
+    )
+
+    current = x_corrected.clone()
+    loop_records: List[Dict[str, object]] = []
+    for t_step in loop_steps:
+        alpha_k = float(alpha_bars[t_step].item())
+        x_tk = add_noise(current, alpha_k)
+        x_hat_k = run_predictor(predictor, x_tk, t_step, predictor_image_size=predictor_image_size)
+        _, hf_k = dwt2_rgb_tensor(x_hat_k[0], wavelet=wavelet)
+        if replacement_mode == "hard":
+            hf_k_selected = hf_k if ablation_hard_hf_source == "pred" else hf_orig
+        else:
+            hf_k_selected = fuse_high_frequency(hf_orig, hf_k, hf_preserve=hf_preserve, hf_shrink=hf_shrink)
+        current = (
+            idwt2_rgb_tensor(ll_anchor, hf_k_selected, wavelet=wavelet, target_hw=target_hw)
+            .to(x_adv.device)
+            .unsqueeze(0)
+            .clamp(0.0, 1.0)
+        )
+        loop_records.append(
+            {
+                "t_step": t_step,
+                "x_tk": x_tk.detach().clone(),
+                "x_hat_k": x_hat_k.detach().clone(),
+                "x_corrected_k": current.detach().clone(),
+                "ll_anchor_source": "patch_mix",
+                "hf_k_selected": {k: v.detach().clone() for k, v in hf_k_selected.items()},
+            }
+        )
+
+    patch_predictor_calls = int(math.ceil(num_patches / float(patch_batch_size)))
+    infer_ms_total = float(infer_base_ms + infer_patch_ms)
+    trace: Dict[str, object] = {
+        "ll_orig": ll_orig,
+        "hf_orig": hf_orig,
+        "x_t": base_trace["x_t"],
+        "x0_hat": x_patch.detach().clone(),
+        "ll_hat": ll_patch,
+        "hf_hat": hf_patch,
+        "ll_anchor": ll_anchor,
+        "hf_selected": hf_patch,
+        "x_corrected": x_corrected.detach().clone(),
+        "loop_records": loop_records,
+        "ablation": {
+            "ll_source": ablation_ll_source,
+            "hard_hf_source": ablation_hard_hf_source,
+        },
+        "patch": {
+            "enabled": True,
+            "patch_size": int(patch_size),
+            "patch_stride": int(patch_stride),
+            "patch_batch_size": int(patch_batch_size),
+            "patch_weight_sigma": float(patch_weight_sigma),
+            "patch_lowfreq_alpha": float(alpha_mix),
+            "patch_ll_source": patch_ll_source,
+            "num_patches": num_patches,
+            "predictor_calls_patch": patch_predictor_calls,
+            "predictor_ms_global": float(infer_base_ms),
+            "predictor_ms_patch": float(infer_patch_ms),
+        },
+        "predictor_calls": int(1 + patch_predictor_calls + len(loop_steps)),
+    }
+    return x_corrected, current, trace, infer_ms_total
 
 
 def process_one_image(
@@ -568,6 +863,14 @@ def process_one_image(
         predictor_image_size=args.predictor_image_size,
         ablation_ll_source=args.ablation_ll_source,
         ablation_hard_hf_source=args.ablation_hard_hf_source,
+        patch_mode=args.patch_mode,
+        patch_size=args.patch_size,
+        patch_stride=args.patch_stride,
+        patch_batch_size=args.patch_batch_size,
+        patch_weight_sigma=args.patch_weight_sigma,
+        patch_lowfreq_alpha=args.patch_lowfreq_alpha,
+        patch_ll_source=args.patch_ll_source,
+        patch_pad_mode=args.patch_pad_mode,
     )
 
     ll_orig = trace["ll_orig"]
@@ -614,7 +917,7 @@ def process_one_image(
     panel.save(sample_dir / "08_compare_adv_corrected_final.png")
 
     metrics = compute_metrics(x_adv[0], x_final[0])
-    metrics["NFE"] = 1 + len(loop_steps)
+    metrics["NFE"] = int(trace.get("predictor_calls", 1 + len(loop_steps)))
     metrics["single_step_infer_ms"] = float(infer_ms)
 
     if args.clean_dir is not None:
@@ -638,6 +941,14 @@ def process_one_image(
         "self_correct_steps": loop_steps,
         "predictor_type": args.predictor_type,
         "predictor_image_size": args.predictor_image_size,
+        "patch_mode": bool(args.patch_mode),
+        "patch_size": args.patch_size,
+        "patch_stride": args.patch_stride,
+        "patch_batch_size": args.patch_batch_size,
+        "patch_weight_sigma": args.patch_weight_sigma,
+        "patch_lowfreq_alpha": args.patch_lowfreq_alpha,
+        "patch_ll_source": args.patch_ll_source,
+        "patch_pad_mode": args.patch_pad_mode,
         "replacement_mode": args.replacement_mode,
         "ablation_ll_source": args.ablation_ll_source,
         "ablation_hard_hf_source": args.ablation_hard_hf_source,

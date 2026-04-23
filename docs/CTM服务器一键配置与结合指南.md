@@ -45,6 +45,19 @@ SAVE_REFERENCE_EVERY=10 \
 bash scripts/run_wgcp_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_eval_ctm
 ```
 
+启用 Patch-WGCP（推荐首轮）：
+
+```bash
+PATCH_MODE=1 \
+PATCH_SIZE=64 \
+PATCH_STRIDE=32 \
+PATCH_BATCH_SIZE=64 \
+PATCH_LOWFREQ_ALPHA=0.1 \
+PATCH_LL_SOURCE=hat \
+GLOB_PATTERN="*.JPEG" MAX_IMAGES=100 LIGHTWEIGHT_MODE=1 SAVE_REFERENCE_EVERY=10 \
+bash scripts/run_wgcp_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_eval_ctm_patch
+```
+
 当前脚本默认关键参数：
 
 - `self_correct_k=0`

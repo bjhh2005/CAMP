@@ -194,6 +194,36 @@ def parse_args() -> argparse.Namespace:
         choices=["pred", "orig"],
         help="Ablation only under replacement_mode=hard: HF source. 'pred'=paper default, 'orig'=keep original HF.",
     )
+    parser.add_argument("--patch_mode", action="store_true", help="Enable Patch-WGCP purification pipeline.")
+    parser.add_argument("--patch_size", type=int, default=64, help="Patch size for Patch-WGCP.")
+    parser.add_argument("--patch_stride", type=int, default=32, help="Patch stride for Patch-WGCP.")
+    parser.add_argument("--patch_batch_size", type=int, default=64, help="Patch CTM inference batch size.")
+    parser.add_argument(
+        "--patch_weight_sigma",
+        type=float,
+        default=0.0,
+        help="Gaussian sigma (in pixels) for patch blending; <=0 means auto (patch_size/6).",
+    )
+    parser.add_argument(
+        "--patch_lowfreq_alpha",
+        type=float,
+        default=0.1,
+        help="Low-frequency blend weight between global-base and patch branch (0..1).",
+    )
+    parser.add_argument(
+        "--patch_ll_source",
+        type=str,
+        default="hat",
+        choices=["hat", "orig"],
+        help="LL source used inside each patch branch before folding.",
+    )
+    parser.add_argument(
+        "--patch_pad_mode",
+        type=str,
+        default="reflect",
+        choices=["reflect", "replicate", "constant"],
+        help="Padding mode used before unfold when shape is not divisible by patch stride.",
+    )
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -583,6 +613,14 @@ def main() -> None:
             predictor_image_size=args.predictor_image_size,
             ablation_ll_source=args.ablation_ll_source,
             ablation_hard_hf_source=args.ablation_hard_hf_source,
+            patch_mode=args.patch_mode,
+            patch_size=args.patch_size,
+            patch_stride=args.patch_stride,
+            patch_batch_size=args.patch_batch_size,
+            patch_weight_sigma=args.patch_weight_sigma,
+            patch_lowfreq_alpha=args.patch_lowfreq_alpha,
+            patch_ll_source=args.patch_ll_source,
+            patch_pad_mode=args.patch_pad_mode,
         )
         if save_detail:
             save_purify_trace(sample_dir, args.t_star, trace, x_corrected, x_final)
@@ -630,10 +668,18 @@ def main() -> None:
                 "t_star": args.t_star,
                 "t_bridge": args.t_bridge if args.t_bridge > 0 else max(2, int(round(args.t_star * 0.25))),
                 "self_correct_steps": loop_steps,
-                "NFE": 1 + len(loop_steps),
+                "NFE": int(trace.get("predictor_calls", 1 + len(loop_steps))),
                 "single_step_infer_ms": float(infer_ms),
                 "predictor_type": args.predictor_type,
                 "predictor_image_size": args.predictor_image_size,
+                "patch_mode": bool(args.patch_mode),
+                "patch_size": args.patch_size,
+                "patch_stride": args.patch_stride,
+                "patch_batch_size": args.patch_batch_size,
+                "patch_weight_sigma": args.patch_weight_sigma,
+                "patch_lowfreq_alpha": args.patch_lowfreq_alpha,
+                "patch_ll_source": args.patch_ll_source,
+                "patch_pad_mode": args.patch_pad_mode,
                 "replacement_mode": args.replacement_mode,
                 "ablation_ll_source": args.ablation_ll_source,
                 "ablation_hard_hf_source": args.ablation_hard_hf_source,
