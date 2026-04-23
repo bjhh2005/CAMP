@@ -58,6 +58,21 @@ GLOB_PATTERN="*.JPEG" MAX_IMAGES=100 LIGHTWEIGHT_MODE=1 SAVE_REFERENCE_EVERY=10 
 bash scripts/run_wgcp_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_eval_ctm_patch
 ```
 
+最小正式对照（推荐，替代 A0-A5 全跑）：
+
+```bash
+MAX_IMAGES=100 \
+SAVE_DETAIL_EVERY=10 \
+GLOB_PATTERN="*.JPEG" \
+bash scripts/run_patch_minimal_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_patch_min
+```
+
+该脚本固定运行 3 组：
+
+1. `A5_global`
+2. `A5_patch_main`（默认 `patch_stride=32`, `patch_lowfreq_alpha=0.1`）
+3. `A5_patch_alpha0`（仅把 `patch_lowfreq_alpha` 设为 `0.0`）
+
 当前脚本默认关键参数：
 
 - `self_correct_k=0`
