@@ -70,8 +70,24 @@ bash scripts/run_patch_minimal_ctm_server.sh ./data/imagenet_real ./outputs/wgcp
 该脚本固定运行 3 组：
 
 1. `A5_global`
-2. `A5_patch_main`（默认 `patch_stride=32`, `patch_lowfreq_alpha=0.1`）
+2. `A5_patch_main`（默认 `replacement_mode=adaptive_ms`, `patch_stride=32`, `patch_lowfreq_alpha=0.1`）
 3. `A5_patch_alpha0`（仅把 `patch_lowfreq_alpha` 设为 `0.0`）
+
+可选覆盖：
+
+- `GLOBAL_REPLACEMENT_MODE=hard|fused|adaptive_ms`
+- `PATCH_REPLACEMENT_MODE=hard|fused|adaptive_ms`
+
+若要启用多尺度自适应融合（adaptive_ms），可在命令末尾追加：
+
+```bash
+--replacement_mode adaptive_ms \
+--ms_levels 3 \
+--ms_gamma_levels 1.6,1.2,0.9 \
+--ms_w_min 0.05 \
+--ms_w_max 0.95 \
+--ms_ll_alpha 0.1
+```
 
 当前脚本默认关键参数：
 

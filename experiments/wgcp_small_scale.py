@@ -95,8 +95,8 @@ def parse_args() -> argparse.Namespace:
         "--replacement_mode",
         type=str,
         default="hard",
-        choices=["hard", "fused"],
-        help="HF replacement strategy: paper-default hard replacement or fused replacement",
+        choices=["hard", "fused", "adaptive_ms"],
+        help="HF replacement strategy: hard / fused / adaptive multi-scale fusion",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -112,6 +112,22 @@ def parse_args() -> argparse.Namespace:
         choices=["pred", "orig"],
         help="Ablation only under replacement_mode=hard: HF source. 'pred'=paper default, 'orig'=keep original HF.",
     )
+    parser.add_argument("--ms_levels", type=int, default=3, help="Wavelet decomposition levels for adaptive_ms mode.")
+    parser.add_argument(
+        "--ms_gamma_levels",
+        type=str,
+        default="1.6,1.2,0.9",
+        help="Gamma schedule for adaptive_ms by level1->L (comma separated).",
+    )
+    parser.add_argument("--ms_w_min", type=float, default=0.05, help="Lower clamp for adaptive_ms mask.")
+    parser.add_argument("--ms_w_max", type=float, default=0.95, help="Upper clamp for adaptive_ms mask.")
+    parser.add_argument(
+        "--ms_ll_alpha",
+        type=float,
+        default=0.1,
+        help="Deep LL blend alpha in adaptive_ms: LL=(1-a)*LL_orig + a*LL_pred.",
+    )
+    parser.add_argument("--ms_eps", type=float, default=1e-6, help="Numerical epsilon for adaptive_ms.")
     parser.add_argument("--patch_mode", action="store_true", help="Enable Patch-WGCP purification pipeline.")
     parser.add_argument("--patch_size", type=int, default=64, help="Patch size for Patch-WGCP.")
     parser.add_argument("--patch_stride", type=int, default=32, help="Patch stride for Patch-WGCP.")
@@ -316,6 +332,153 @@ def idwt2_rgb_tensor(
         if pad_h > 0 or pad_w > 0:
             rec_t = F.pad(rec_t, (0, pad_w, 0, pad_h), mode="replicate")
     return rec_t
+
+
+def resolve_ms_gamma_schedule(levels: int, gamma_text: str) -> Dict[int, float]:
+    parts = [x.strip() for x in gamma_text.split(",") if x.strip()]
+    if not parts:
+        vals = [1.0]
+    else:
+        vals = [float(x) for x in parts]
+    out: Dict[int, float] = {}
+    for lvl in range(1, levels + 1):
+        idx = min(lvl - 1, len(vals) - 1)
+        out[lvl] = float(vals[idx])
+    return out
+
+
+def wavedec2_rgb_tensor(
+    x_chw: Tensor,
+    wavelet: str,
+    levels: int,
+) -> Tuple[Tensor, Dict[int, Dict[str, Tensor]], int]:
+    x_np = x_chw.detach().cpu().numpy()
+    wave = pywt.Wavelet(wavelet)
+    max_level = pywt.dwt_max_level(min(int(x_chw.shape[-2]), int(x_chw.shape[-1])), wave.dec_len)
+    use_levels = max(1, min(int(levels), int(max_level)))
+
+    ll_list: List[np.ndarray] = []
+    hf_collect: Dict[int, Dict[str, List[np.ndarray]]] = {
+        lvl: {"HL": [], "LH": [], "HH": []} for lvl in range(1, use_levels + 1)
+    }
+    for c in range(x_np.shape[0]):
+        coeffs = pywt.wavedec2(x_np[c], wavelet=wavelet, mode="periodization", level=use_levels)
+        ll_list.append(coeffs[0])
+        # coeffs[1] is level=use_levels, coeffs[use_levels] is level=1
+        for lvl in range(1, use_levels + 1):
+            idx = use_levels - lvl + 1
+            ch, cv, cd = coeffs[idx]
+            hf_collect[lvl]["HL"].append(ch)
+            hf_collect[lvl]["LH"].append(cv)
+            hf_collect[lvl]["HH"].append(cd)
+
+    ll_t = torch.from_numpy(np.stack(ll_list, axis=0)).float()
+    hf_levels: Dict[int, Dict[str, Tensor]] = {}
+    for lvl in range(1, use_levels + 1):
+        hf_levels[lvl] = {
+            band: torch.from_numpy(np.stack(hf_collect[lvl][band], axis=0)).float()
+            for band in ("HL", "LH", "HH")
+        }
+    return ll_t, hf_levels, use_levels
+
+
+def waverec2_rgb_tensor(
+    ll_chw: Tensor,
+    hf_levels: Dict[int, Dict[str, Tensor]],
+    wavelet: str,
+    target_hw: Optional[Tuple[int, int]] = None,
+) -> Tensor:
+    levels = len(hf_levels)
+    ll_np = ll_chw.detach().cpu().numpy()
+    hf_np_levels: Dict[int, Dict[str, np.ndarray]] = {
+        lvl: {band: hf_levels[lvl][band].detach().cpu().numpy() for band in ("HL", "LH", "HH")}
+        for lvl in range(1, levels + 1)
+    }
+    rec_list: List[np.ndarray] = []
+    for c in range(ll_np.shape[0]):
+        coeffs = [ll_np[c]]
+        for lvl in range(levels, 0, -1):
+            bands = hf_np_levels[lvl]
+            coeffs.append(
+                (
+                    bands["HL"][c],
+                    bands["LH"][c],
+                    bands["HH"][c],
+                )
+            )
+        rec = pywt.waverec2(coeffs, wavelet=wavelet, mode="periodization")
+        rec_list.append(rec)
+    rec_t = torch.from_numpy(np.stack(rec_list, axis=0)).float()
+    if target_hw is not None:
+        target_h, target_w = int(target_hw[0]), int(target_hw[1])
+        rec_t = rec_t[:, :target_h, :target_w]
+        cur_h, cur_w = rec_t.shape[-2], rec_t.shape[-1]
+        pad_h = max(0, target_h - cur_h)
+        pad_w = max(0, target_w - cur_w)
+        if pad_h > 0 or pad_w > 0:
+            rec_t = F.pad(rec_t, (0, pad_w, 0, pad_h), mode="replicate")
+    return rec_t
+
+
+def median_abs_deviation(coeff: Tensor, eps: float = 1e-6) -> Tensor:
+    flat = coeff.flatten(1)
+    med = flat.median(dim=1).values.unsqueeze(-1).unsqueeze(-1)
+    mad = (coeff - med).abs().flatten(1).median(dim=1).values
+    return mad.clamp_min(eps)
+
+
+def adaptive_multiscale_fusion(
+    x_orig_chw: Tensor,
+    x_pred_chw: Tensor,
+    wavelet: str,
+    levels: int,
+    gamma_text: str,
+    w_min: float,
+    w_max: float,
+    ll_alpha: float,
+    eps: float = 1e-6,
+    target_hw: Optional[Tuple[int, int]] = None,
+) -> Tuple[Tensor, Dict[str, object]]:
+    ll_orig, hf_orig_levels, use_levels = wavedec2_rgb_tensor(x_orig_chw, wavelet=wavelet, levels=levels)
+    ll_pred, hf_pred_levels, _ = wavedec2_rgb_tensor(x_pred_chw, wavelet=wavelet, levels=use_levels)
+    gamma_sched = resolve_ms_gamma_schedule(use_levels, gamma_text)
+
+    w_lo = float(min(w_min, w_max))
+    w_hi = float(max(w_min, w_max))
+    ll_a = float(np.clip(ll_alpha, 0.0, 1.0))
+    ll_final = (1.0 - ll_a) * ll_orig + ll_a * ll_pred
+
+    hf_final_levels: Dict[int, Dict[str, Tensor]] = {}
+    level_stats: Dict[str, Dict[str, float]] = {}
+    for lvl in range(1, use_levels + 1):
+        gamma = float(gamma_sched[lvl])
+        lvl_stats: Dict[str, float] = {"gamma": gamma}
+        hf_final_levels[lvl] = {}
+        for band in ("HL", "LH", "HH"):
+            orig = hf_orig_levels[lvl][band]
+            pred = hf_pred_levels[lvl][band]
+            residual = orig - pred
+            mad = median_abs_deviation(residual, eps=eps)
+            norm_diff = residual.abs() / mad.unsqueeze(-1).unsqueeze(-1)
+            weight = torch.exp(-gamma * norm_diff).clamp(w_lo, w_hi)
+            fused = weight * orig + (1.0 - weight) * pred
+            hf_final_levels[lvl][band] = fused
+            lvl_stats[f"w_mean_{band}"] = float(weight.mean().item())
+        level_stats[f"L{lvl}"] = lvl_stats
+
+    x_rec = waverec2_rgb_tensor(ll_final, hf_final_levels, wavelet=wavelet, target_hw=target_hw)
+    meta: Dict[str, object] = {
+        "levels": int(use_levels),
+        "gamma_schedule": {f"L{k}": float(v) for k, v in gamma_sched.items()},
+        "w_min": float(w_lo),
+        "w_max": float(w_hi),
+        "ll_alpha": float(ll_a),
+        "level_stats": level_stats,
+        "ll_final": ll_final,
+        "hf_final_levels": hf_final_levels,
+        "ll_pred": ll_pred,
+    }
+    return x_rec, meta
 
 
 def robust_sigma(coeff: Tensor) -> Tensor:
@@ -557,6 +720,12 @@ def _purify_adv_tensor_global(
     predictor_image_size: int = 0,
     ablation_ll_source: str = "orig",
     ablation_hard_hf_source: str = "pred",
+    ms_levels: int = 3,
+    ms_gamma_levels: str = "1.6,1.2,0.9",
+    ms_w_min: float = 0.05,
+    ms_w_max: float = 0.95,
+    ms_ll_alpha: float = 0.1,
+    ms_eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     if x_adv.ndim != 4 or x_adv.shape[0] != 1:
         raise ValueError("x_adv must have shape [1, C, H, W]")
@@ -572,16 +741,35 @@ def _purify_adv_tensor_global(
     infer_ms = (time.perf_counter() - t0) * 1000.0
 
     ll_hat, hf_hat = dwt2_rgb_tensor(x0_hat[0], wavelet=wavelet)
-    ll_anchor = ll_orig if ablation_ll_source == "orig" else ll_hat
+    adaptive_meta: Dict[str, object] | None = None
     # CAMP default: keep LL from x_adv (ll_orig) and use predictor HF under hard replacement.
     if replacement_mode == "hard":
+        ll_anchor = ll_orig if ablation_ll_source == "orig" else ll_hat
         hf_selected = hf_hat if ablation_hard_hf_source == "pred" else hf_orig
+        x_first = idwt2_rgb_tensor(ll_anchor, hf_selected, wavelet=wavelet, target_hw=target_hw)
     elif replacement_mode == "fused":
+        ll_anchor = ll_orig if ablation_ll_source == "orig" else ll_hat
         hf_selected = fuse_high_frequency(hf_orig, hf_hat, hf_preserve=hf_preserve, hf_shrink=hf_shrink)
+        x_first = idwt2_rgb_tensor(ll_anchor, hf_selected, wavelet=wavelet, target_hw=target_hw)
+    elif replacement_mode == "adaptive_ms":
+        x_first, adaptive_meta = adaptive_multiscale_fusion(
+            x_orig_chw=x_adv[0],
+            x_pred_chw=x0_hat[0],
+            wavelet=wavelet,
+            levels=ms_levels,
+            gamma_text=ms_gamma_levels,
+            w_min=ms_w_min,
+            w_max=ms_w_max,
+            ll_alpha=ms_ll_alpha,
+            eps=ms_eps,
+            target_hw=target_hw,
+        )
+        ll_anchor = adaptive_meta["ll_final"]
+        hf_selected = dwt2_rgb_tensor(x_first, wavelet=wavelet)[1]
     else:
         raise ValueError(f"Unknown replacement_mode: {replacement_mode}")
 
-    x_corrected = idwt2_rgb_tensor(ll_anchor, hf_selected, wavelet=wavelet, target_hw=target_hw).to(x_adv.device).unsqueeze(0)
+    x_corrected = x_first.to(x_adv.device).unsqueeze(0)
     x_corrected = x_corrected.clamp(0.0, 1.0)
 
     current = x_corrected.clone()
@@ -591,17 +779,40 @@ def _purify_adv_tensor_global(
         x_tk = add_noise(current, alpha_k)
         x_hat_k = run_predictor(predictor, x_tk, t_step, predictor_image_size=predictor_image_size)
         ll_k, hf_k = dwt2_rgb_tensor(x_hat_k[0], wavelet=wavelet)
-        ll_anchor_k = ll_orig if ablation_ll_source == "orig" else ll_k
         if replacement_mode == "hard":
+            ll_anchor_k = ll_orig if ablation_ll_source == "orig" else ll_k
             hf_k_selected = hf_k if ablation_hard_hf_source == "pred" else hf_orig
-        else:
+            current = (
+                idwt2_rgb_tensor(ll_anchor_k, hf_k_selected, wavelet=wavelet, target_hw=target_hw)
+                .to(x_adv.device)
+                .unsqueeze(0)
+                .clamp(0.0, 1.0)
+            )
+        elif replacement_mode == "fused":
+            ll_anchor_k = ll_orig if ablation_ll_source == "orig" else ll_k
             hf_k_selected = fuse_high_frequency(hf_orig, hf_k, hf_preserve=hf_preserve, hf_shrink=hf_shrink)
-        current = (
-            idwt2_rgb_tensor(ll_anchor_k, hf_k_selected, wavelet=wavelet, target_hw=target_hw)
-            .to(x_adv.device)
-            .unsqueeze(0)
-            .clamp(0.0, 1.0)
-        )
+            current = (
+                idwt2_rgb_tensor(ll_anchor_k, hf_k_selected, wavelet=wavelet, target_hw=target_hw)
+                .to(x_adv.device)
+                .unsqueeze(0)
+                .clamp(0.0, 1.0)
+            )
+        else:
+            x_k, adaptive_meta_k = adaptive_multiscale_fusion(
+                x_orig_chw=x_adv[0],
+                x_pred_chw=x_hat_k[0],
+                wavelet=wavelet,
+                levels=ms_levels,
+                gamma_text=ms_gamma_levels,
+                w_min=ms_w_min,
+                w_max=ms_w_max,
+                ll_alpha=ms_ll_alpha,
+                eps=ms_eps,
+                target_hw=target_hw,
+            )
+            ll_anchor_k = adaptive_meta_k["ll_final"]
+            hf_k_selected = dwt2_rgb_tensor(x_k, wavelet=wavelet)[1]
+            current = x_k.to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
         loop_records.append(
             {
                 "t_step": t_step,
@@ -628,6 +839,7 @@ def _purify_adv_tensor_global(
             "ll_source": ablation_ll_source,
             "hard_hf_source": ablation_hard_hf_source,
         },
+        "adaptive_ms": adaptive_meta,
         "predictor_calls": 1 + len(loop_steps),
     }
     return x_corrected, current, trace, infer_ms
@@ -654,6 +866,12 @@ def purify_adv_tensor(
     patch_lowfreq_alpha: float = 0.1,
     patch_ll_source: str = "hat",
     patch_pad_mode: str = "reflect",
+    ms_levels: int = 3,
+    ms_gamma_levels: str = "1.6,1.2,0.9",
+    ms_w_min: float = 0.05,
+    ms_w_max: float = 0.95,
+    ms_ll_alpha: float = 0.1,
+    ms_eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     """
     Purify one adversarial tensor with WGCP.
@@ -674,6 +892,12 @@ def purify_adv_tensor(
             predictor_image_size=predictor_image_size,
             ablation_ll_source=ablation_ll_source,
             ablation_hard_hf_source=ablation_hard_hf_source,
+            ms_levels=ms_levels,
+            ms_gamma_levels=ms_gamma_levels,
+            ms_w_min=ms_w_min,
+            ms_w_max=ms_w_max,
+            ms_ll_alpha=ms_ll_alpha,
+            ms_eps=ms_eps,
         )
 
     if x_adv.ndim != 4 or x_adv.shape[0] != 1:
@@ -698,6 +922,12 @@ def purify_adv_tensor(
         predictor_image_size=predictor_image_size,
         ablation_ll_source=ablation_ll_source,
         ablation_hard_hf_source=ablation_hard_hf_source,
+        ms_levels=ms_levels,
+        ms_gamma_levels=ms_gamma_levels,
+        ms_w_min=ms_w_min,
+        ms_w_max=ms_w_max,
+        ms_ll_alpha=ms_ll_alpha,
+        ms_eps=ms_eps,
     )
 
     alpha_t = float(alpha_bars[t_star].item())
@@ -724,19 +954,37 @@ def purify_adv_tensor(
 
             if replacement_mode == "hard":
                 hf_p_selected = hf_p_hat if ablation_hard_hf_source == "pred" else hf_p_orig
+                rec_p = idwt2_rgb_tensor(
+                    ll_p_anchor,
+                    hf_p_selected,
+                    wavelet=wavelet,
+                    target_hw=(patch_size, patch_size),
+                )
             elif replacement_mode == "fused":
                 hf_p_selected = fuse_high_frequency(
                     hf_p_orig, hf_p_hat, hf_preserve=hf_preserve, hf_shrink=hf_shrink
                 )
+                rec_p = idwt2_rgb_tensor(
+                    ll_p_anchor,
+                    hf_p_selected,
+                    wavelet=wavelet,
+                    target_hw=(patch_size, patch_size),
+                )
+            elif replacement_mode == "adaptive_ms":
+                rec_p, _ = adaptive_multiscale_fusion(
+                    x_orig_chw=batch_adv[idx],
+                    x_pred_chw=batch_hat[idx],
+                    wavelet=wavelet,
+                    levels=ms_levels,
+                    gamma_text=ms_gamma_levels,
+                    w_min=ms_w_min,
+                    w_max=ms_w_max,
+                    ll_alpha=ms_ll_alpha,
+                    eps=ms_eps,
+                    target_hw=(patch_size, patch_size),
+                )
             else:
                 raise ValueError(f"Unknown replacement_mode: {replacement_mode}")
-
-            rec_p = idwt2_rgb_tensor(
-                ll_p_anchor,
-                hf_p_selected,
-                wavelet=wavelet,
-                target_hw=(patch_size, patch_size),
-            )
             rec_batch.append(rec_p.to(x_adv.device))
         patch_outputs.append(torch.stack(rec_batch, dim=0))
 
@@ -776,14 +1024,35 @@ def purify_adv_tensor(
         _, hf_k = dwt2_rgb_tensor(x_hat_k[0], wavelet=wavelet)
         if replacement_mode == "hard":
             hf_k_selected = hf_k if ablation_hard_hf_source == "pred" else hf_orig
-        else:
+            current = (
+                idwt2_rgb_tensor(ll_anchor, hf_k_selected, wavelet=wavelet, target_hw=target_hw)
+                .to(x_adv.device)
+                .unsqueeze(0)
+                .clamp(0.0, 1.0)
+            )
+        elif replacement_mode == "fused":
             hf_k_selected = fuse_high_frequency(hf_orig, hf_k, hf_preserve=hf_preserve, hf_shrink=hf_shrink)
-        current = (
-            idwt2_rgb_tensor(ll_anchor, hf_k_selected, wavelet=wavelet, target_hw=target_hw)
-            .to(x_adv.device)
-            .unsqueeze(0)
-            .clamp(0.0, 1.0)
-        )
+            current = (
+                idwt2_rgb_tensor(ll_anchor, hf_k_selected, wavelet=wavelet, target_hw=target_hw)
+                .to(x_adv.device)
+                .unsqueeze(0)
+                .clamp(0.0, 1.0)
+            )
+        else:
+            x_k, _ = adaptive_multiscale_fusion(
+                x_orig_chw=x_adv[0],
+                x_pred_chw=x_hat_k[0],
+                wavelet=wavelet,
+                levels=ms_levels,
+                gamma_text=ms_gamma_levels,
+                w_min=ms_w_min,
+                w_max=ms_w_max,
+                ll_alpha=ms_ll_alpha,
+                eps=ms_eps,
+                target_hw=target_hw,
+            )
+            hf_k_selected = dwt2_rgb_tensor(x_k, wavelet=wavelet)[1]
+            current = x_k.to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
         loop_records.append(
             {
                 "t_step": t_step,
@@ -871,6 +1140,12 @@ def process_one_image(
         patch_lowfreq_alpha=args.patch_lowfreq_alpha,
         patch_ll_source=args.patch_ll_source,
         patch_pad_mode=args.patch_pad_mode,
+        ms_levels=args.ms_levels,
+        ms_gamma_levels=args.ms_gamma_levels,
+        ms_w_min=args.ms_w_min,
+        ms_w_max=args.ms_w_max,
+        ms_ll_alpha=args.ms_ll_alpha,
+        ms_eps=args.ms_eps,
     )
 
     ll_orig = trace["ll_orig"]
@@ -949,6 +1224,12 @@ def process_one_image(
         "patch_lowfreq_alpha": args.patch_lowfreq_alpha,
         "patch_ll_source": args.patch_ll_source,
         "patch_pad_mode": args.patch_pad_mode,
+        "ms_levels": args.ms_levels,
+        "ms_gamma_levels": args.ms_gamma_levels,
+        "ms_w_min": args.ms_w_min,
+        "ms_w_max": args.ms_w_max,
+        "ms_ll_alpha": args.ms_ll_alpha,
+        "ms_eps": args.ms_eps,
         "replacement_mode": args.replacement_mode,
         "ablation_ll_source": args.ablation_ll_source,
         "ablation_hard_hf_source": args.ablation_hard_hf_source,

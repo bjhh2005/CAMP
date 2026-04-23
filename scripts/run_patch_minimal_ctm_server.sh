@@ -30,6 +30,8 @@ MAX_IMAGES="${MAX_IMAGES:-100}"
 MIN_CLEAN_CONF="${MIN_CLEAN_CONF:-0.05}"
 SAVE_DETAIL_EVERY="${SAVE_DETAIL_EVERY:-10}"
 GLOB_PATTERN="${GLOB_PATTERN:-*.JPEG}"
+GLOBAL_REPLACEMENT_MODE="${GLOBAL_REPLACEMENT_MODE:-hard}"
+PATCH_REPLACEMENT_MODE="${PATCH_REPLACEMENT_MODE:-adaptive_ms}"
 
 # Patch-WGCP defaults (main case uses these unless overridden)
 PATCH_SIZE="${PATCH_SIZE:-64}"
@@ -39,6 +41,12 @@ PATCH_WEIGHT_SIGMA="${PATCH_WEIGHT_SIGMA:-0}"
 PATCH_LOWFREQ_ALPHA_MAIN="${PATCH_LOWFREQ_ALPHA_MAIN:-0.1}"
 PATCH_LL_SOURCE="${PATCH_LL_SOURCE:-hat}"
 PATCH_PAD_MODE="${PATCH_PAD_MODE:-reflect}"
+MS_LEVELS="${MS_LEVELS:-3}"
+MS_GAMMA_LEVELS="${MS_GAMMA_LEVELS:-1.6,1.2,0.9}"
+MS_W_MIN="${MS_W_MIN:-0.05}"
+MS_W_MAX="${MS_W_MAX:-0.95}"
+MS_LL_ALPHA="${MS_LL_ALPHA:-0.1}"
+MS_EPS="${MS_EPS:-1e-6}"
 
 PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE')}))")"
 
@@ -49,6 +57,8 @@ echo "  output root: $OUTPUT_ROOT"
 echo "  glob: $GLOB_PATTERN"
 echo "  max_images: $MAX_IMAGES"
 echo "  save_detail_every: $SAVE_DETAIL_EVERY"
+echo "  global_replacement_mode: $GLOBAL_REPLACEMENT_MODE"
+echo "  patch_replacement_mode: $PATCH_REPLACEMENT_MODE"
 echo "  predictor_module: $PREDICTOR_MODULE"
 echo "  ctm repo: $CTM_REPO"
 echo "  ckpt: $CTM_CKPT"
@@ -79,7 +89,6 @@ run_case() {
     --predictor_image_size "$PREDICTOR_IMAGE_SIZE" \
     --t_star 40 \
     --self_correct_k 0 \
-    --replacement_mode hard \
     --ablation_ll_source orig \
     --ablation_hard_hf_source pred \
     --min_clean_conf "$MIN_CLEAN_CONF" \
@@ -90,11 +99,13 @@ run_case() {
 
 # 1) Global A5 baseline
 run_case "A5_global" \
-  --device cuda
+  --device cuda \
+  --replacement_mode "$GLOBAL_REPLACEMENT_MODE"
 
 # 2) Patch-A5 main
 run_case "A5_patch_main" \
   --device cuda \
+  --replacement_mode "$PATCH_REPLACEMENT_MODE" \
   --patch_mode \
   --patch_size "$PATCH_SIZE" \
   --patch_stride "$PATCH_STRIDE" \
@@ -102,11 +113,18 @@ run_case "A5_patch_main" \
   --patch_weight_sigma "$PATCH_WEIGHT_SIGMA" \
   --patch_lowfreq_alpha "$PATCH_LOWFREQ_ALPHA_MAIN" \
   --patch_ll_source "$PATCH_LL_SOURCE" \
-  --patch_pad_mode "$PATCH_PAD_MODE"
+  --patch_pad_mode "$PATCH_PAD_MODE" \
+  --ms_levels "$MS_LEVELS" \
+  --ms_gamma_levels "$MS_GAMMA_LEVELS" \
+  --ms_w_min "$MS_W_MIN" \
+  --ms_w_max "$MS_W_MAX" \
+  --ms_ll_alpha "$MS_LL_ALPHA" \
+  --ms_eps "$MS_EPS"
 
 # 3) Patch-A5 alpha=0 contrast
 run_case "A5_patch_alpha0" \
   --device cuda \
+  --replacement_mode "$PATCH_REPLACEMENT_MODE" \
   --patch_mode \
   --patch_size "$PATCH_SIZE" \
   --patch_stride "$PATCH_STRIDE" \
@@ -114,7 +132,13 @@ run_case "A5_patch_alpha0" \
   --patch_weight_sigma "$PATCH_WEIGHT_SIGMA" \
   --patch_lowfreq_alpha 0.0 \
   --patch_ll_source "$PATCH_LL_SOURCE" \
-  --patch_pad_mode "$PATCH_PAD_MODE"
+  --patch_pad_mode "$PATCH_PAD_MODE" \
+  --ms_levels "$MS_LEVELS" \
+  --ms_gamma_levels "$MS_GAMMA_LEVELS" \
+  --ms_w_min "$MS_W_MIN" \
+  --ms_w_max "$MS_W_MAX" \
+  --ms_ll_alpha "$MS_LL_ALPHA" \
+  --ms_eps "$MS_EPS"
 
 conda run -n "$CAMP_ENV" python - "$OUTPUT_ROOT" <<'PY'
 import json

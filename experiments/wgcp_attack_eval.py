@@ -177,8 +177,8 @@ def parse_args() -> argparse.Namespace:
         "--replacement_mode",
         type=str,
         default="hard",
-        choices=["hard", "fused"],
-        help="HF replacement strategy: paper-default hard replacement or fused replacement",
+        choices=["hard", "fused", "adaptive_ms"],
+        help="HF replacement strategy: hard / fused / adaptive multi-scale fusion",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -194,6 +194,22 @@ def parse_args() -> argparse.Namespace:
         choices=["pred", "orig"],
         help="Ablation only under replacement_mode=hard: HF source. 'pred'=paper default, 'orig'=keep original HF.",
     )
+    parser.add_argument("--ms_levels", type=int, default=3, help="Wavelet decomposition levels for adaptive_ms mode.")
+    parser.add_argument(
+        "--ms_gamma_levels",
+        type=str,
+        default="1.6,1.2,0.9",
+        help="Gamma schedule for adaptive_ms by level1->L (comma separated).",
+    )
+    parser.add_argument("--ms_w_min", type=float, default=0.05, help="Lower clamp for adaptive_ms mask.")
+    parser.add_argument("--ms_w_max", type=float, default=0.95, help="Upper clamp for adaptive_ms mask.")
+    parser.add_argument(
+        "--ms_ll_alpha",
+        type=float,
+        default=0.1,
+        help="Deep LL blend alpha in adaptive_ms: LL=(1-a)*LL_orig + a*LL_pred.",
+    )
+    parser.add_argument("--ms_eps", type=float, default=1e-6, help="Numerical epsilon for adaptive_ms.")
     parser.add_argument("--patch_mode", action="store_true", help="Enable Patch-WGCP purification pipeline.")
     parser.add_argument("--patch_size", type=int, default=64, help="Patch size for Patch-WGCP.")
     parser.add_argument("--patch_stride", type=int, default=32, help="Patch stride for Patch-WGCP.")
@@ -621,6 +637,12 @@ def main() -> None:
             patch_lowfreq_alpha=args.patch_lowfreq_alpha,
             patch_ll_source=args.patch_ll_source,
             patch_pad_mode=args.patch_pad_mode,
+            ms_levels=args.ms_levels,
+            ms_gamma_levels=args.ms_gamma_levels,
+            ms_w_min=args.ms_w_min,
+            ms_w_max=args.ms_w_max,
+            ms_ll_alpha=args.ms_ll_alpha,
+            ms_eps=args.ms_eps,
         )
         if save_detail:
             save_purify_trace(sample_dir, args.t_star, trace, x_corrected, x_final)
@@ -680,6 +702,12 @@ def main() -> None:
                 "patch_lowfreq_alpha": args.patch_lowfreq_alpha,
                 "patch_ll_source": args.patch_ll_source,
                 "patch_pad_mode": args.patch_pad_mode,
+                "ms_levels": args.ms_levels,
+                "ms_gamma_levels": args.ms_gamma_levels,
+                "ms_w_min": args.ms_w_min,
+                "ms_w_max": args.ms_w_max,
+                "ms_ll_alpha": args.ms_ll_alpha,
+                "ms_eps": args.ms_eps,
                 "replacement_mode": args.replacement_mode,
                 "ablation_ll_source": args.ablation_ll_source,
                 "ablation_hard_hf_source": args.ablation_hard_hf_source,
