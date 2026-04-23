@@ -78,6 +78,21 @@ bash scripts/run_patch_minimal_ctm_server.sh ./data/imagenet_real ./outputs/wgcp
 - `GLOBAL_REPLACEMENT_MODE=hard|fused|adaptive_ms`
 - `PATCH_REPLACEMENT_MODE=hard|fused|adaptive_ms`
 
+纯频域升级对照（不使用 patch，推荐用于验证你提出的方案 A / A+B）：
+
+```bash
+MAX_IMAGES=100 \
+SAVE_DETAIL_EVERY=10 \
+GLOB_PATTERN="*.JPEG" \
+bash scripts/run_ms_adaptive_minimal_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_ms_min
+```
+
+该脚本固定运行 3 组：
+
+1. `G0_level1_hard`：当前 level-1 硬替换基线
+2. `G1_ms_decouple_hardhf`：方案 A（深层小波解耦）
+3. `G2_ms_adaptive`：方案 A+B（多尺度自适应融合）
+
 若要启用多尺度自适应融合（adaptive_ms），可在命令末尾追加：
 
 ```bash
