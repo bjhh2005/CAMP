@@ -72,6 +72,15 @@ def parse_args() -> argparse.Namespace:
         help="In lightweight mode, save one clean/adv/purified panel every N samples (<=0 disables reference images).",
     )
     parser.add_argument(
+        "--save_detail_every",
+        type=int,
+        default=1,
+        help=(
+            "When not in lightweight mode, save full per-sample detail artifacts every N samples "
+            "(<=0 disables detail artifacts but summary still keeps all samples)."
+        ),
+    )
+    parser.add_argument(
         "--reference_dir",
         type=Path,
         default=None,
@@ -474,6 +483,7 @@ def main() -> None:
     valid_sample_count = 0
     skipped_low_conf_count = 0
     saved_reference_count = 0
+    saved_detail_count = 0
 
     reference_dir: Path | None = None
     if args.lightweight_mode and args.save_reference_every > 0:
@@ -482,9 +492,11 @@ def main() -> None:
 
     for sample_idx, image_path in enumerate(tqdm(image_paths, desc="WGCP attack+eval"), start=1):
         save_reference = args.lightweight_mode and should_save_reference(sample_idx, args.save_reference_every)
+        save_detail = (not args.lightweight_mode) and should_save_reference(sample_idx, args.save_detail_every)
         sample_dir = args.output_dir / image_path.stem
-        if not args.lightweight_mode:
+        if save_detail:
             ensure_dir(sample_dir)
+            saved_detail_count += 1
 
         clean_img = Image.open(image_path).convert("RGB")
         if args.resize is not None:
@@ -492,7 +504,7 @@ def main() -> None:
             clean_img = clean_img.resize((w, h), Image.BICUBIC)
 
         x_clean = pil_to_tensor(clean_img).unsqueeze(0).to(device)
-        if not args.lightweight_mode:
+        if save_detail:
             save_tensor_image(x_clean[0], sample_dir / "00_x_clean.png")
 
         pred_clean, conf_clean = classify(
@@ -510,12 +522,16 @@ def main() -> None:
                 "classifier": args.classifier,
                 "skipped": True,
                 "skip_reason": f"clean_conf<{args.min_clean_conf}",
+                "artifacts": {
+                    "detail_saved": bool(save_detail),
+                    "sample_dir": str(sample_dir) if save_detail else None,
+                },
                 "pseudo_label_eval": {
                     "clean_pred": int(pred_clean.item()),
                     "clean_conf": float(conf_clean.item()),
                 },
             }
-            if not args.lightweight_mode:
+            if save_detail:
                 with open(sample_dir / "metrics.json", "w", encoding="utf-8") as f:
                     json.dump(record, f, ensure_ascii=False, indent=2)
             per_sample.append(record)
@@ -545,7 +561,7 @@ def main() -> None:
                 crop_size=args.clf_crop_size,
             )
 
-        if not args.lightweight_mode:
+        if save_detail:
             save_tensor_image(x_adv[0], sample_dir / "01_x_adv.png")
         pred_adv, conf_adv = classify(
             classifier,
@@ -568,7 +584,7 @@ def main() -> None:
             ablation_ll_source=args.ablation_ll_source,
             ablation_hard_hf_source=args.ablation_hard_hf_source,
         )
-        if not args.lightweight_mode:
+        if save_detail:
             save_purify_trace(sample_dir, args.t_star, trace, x_corrected, x_final)
 
         pred_final, conf_final = classify(
@@ -578,7 +594,7 @@ def main() -> None:
             crop_size=args.clf_crop_size,
         )
 
-        if not args.lightweight_mode:
+        if save_detail:
             panel_clean_adv_final = make_triplet_panel([x_clean[0], x_adv[0], x_final[0]])
             panel_clean_adv_final.save(sample_dir / "09_compare_clean_adv_final.png")
 
@@ -599,6 +615,10 @@ def main() -> None:
         record = {
             "image": str(image_path),
             "classifier": args.classifier,
+            "artifacts": {
+                "detail_saved": bool(save_detail),
+                "sample_dir": str(sample_dir) if save_detail else None,
+            },
             "attack": {
                 "type": args.attack,
                 "eps": args.eps,
@@ -636,7 +656,7 @@ def main() -> None:
             },
         }
 
-        if not args.lightweight_mode:
+        if save_detail:
             with open(sample_dir / "metrics.json", "w", encoding="utf-8") as f:
                 json.dump(record, f, ensure_ascii=False, indent=2)
 
@@ -661,6 +681,8 @@ def main() -> None:
         "recover_rate_on_attacked": recovered / max(1, attacked),
         "clean_pred_consistency_rate": overall_consistent / max(1, valid_sample_count),
         "lightweight_mode": bool(args.lightweight_mode),
+        "save_detail_every": int(args.save_detail_every),
+        "saved_detail_samples": int(saved_detail_count),
         "save_reference_every": int(args.save_reference_every),
         "saved_reference_images": int(saved_reference_count),
         "reference_dir": str(reference_dir) if reference_dir is not None else None,

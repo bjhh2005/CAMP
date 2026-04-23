@@ -31,6 +31,7 @@ MIN_CLEAN_CONF="${MIN_CLEAN_CONF:-0.05}"
 HF_PRESERVE="${HF_PRESERVE:-0.35}"
 HF_SHRINK="${HF_SHRINK:-0.6}"
 GLOB_PATTERN="${GLOB_PATTERN:-*.JPEG}"
+SAVE_DETAIL_EVERY="${SAVE_DETAIL_EVERY:-10}"
 
 PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE')}))")"
 
@@ -39,6 +40,7 @@ echo "  env: $CAMP_ENV"
 echo "  input: $INPUT_DIR"
 echo "  output root: $OUTPUT_ROOT"
 echo "  glob: $GLOB_PATTERN"
+echo "  save_detail_every: $SAVE_DETAIL_EVERY"
 echo "  ctm repo: $CTM_REPO"
 echo "  ckpt: $CTM_CKPT"
 
@@ -66,6 +68,7 @@ run_case() {
     --max_images "$MAX_IMAGES" \
     --glob "$GLOB_PATTERN" \
     --min_clean_conf "$MIN_CLEAN_CONF" \
+    --save_detail_every "$SAVE_DETAIL_EVERY" \
     --archive_tag "ablation_${case_name}" \
     "${EXTRA_ARGS[@]}" \
     "$@"

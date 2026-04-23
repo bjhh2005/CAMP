@@ -55,7 +55,7 @@ bash scripts/run_wgcp_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_eval_ctm
 ## 4. 一键消融（A0-A5）
 
 ```bash
-GLOB_PATTERN="*.JPEG" MAX_IMAGES=100 \
+GLOB_PATTERN="*.JPEG" MAX_IMAGES=100 SAVE_DETAIL_EVERY=10 \
 bash scripts/run_ablation_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_ablation_ctm
 ```
 
