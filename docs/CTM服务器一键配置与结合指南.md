@@ -35,13 +35,18 @@ checkpoint 选择优先级：
 3. `$CTM_CACHE_DIR/ema_0.999_049000.pt`
 4. 仅 `DOWNLOAD_CKPT=1` 时尝试下载
 
-## 3. 推荐主流程（非消融）
+## 3. 推荐主流程（AWDD v2.1 strict）
 
 ```bash
 GLOB_PATTERN="*.JPEG" \
 MAX_IMAGES=100 \
 LIGHTWEIGHT_MODE=1 \
 SAVE_REFERENCE_EVERY=10 \
+WAVELET=db4 \
+REPLACEMENT_MODE=adaptive_ms \
+MS_LEVELS=3 \
+MS_GAMMA_LEVELS="1.6,1.2,0.9" \
+MS_LL_ALPHA=0.08 \
 bash scripts/run_wgcp_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_eval_ctm
 ```
 
@@ -54,6 +59,11 @@ PATCH_STRIDE=32 \
 PATCH_BATCH_SIZE=64 \
 PATCH_LOWFREQ_ALPHA=0.1 \
 PATCH_LL_SOURCE=hat \
+WAVELET=db4 \
+REPLACEMENT_MODE=adaptive_ms \
+MS_LEVELS=3 \
+MS_GAMMA_LEVELS="1.6,1.2,0.9" \
+MS_LL_ALPHA=0.08 \
 GLOB_PATTERN="*.JPEG" MAX_IMAGES=100 LIGHTWEIGHT_MODE=1 SAVE_REFERENCE_EVERY=10 \
 bash scripts/run_wgcp_ctm_server.sh ./data/imagenet_real ./outputs/wgcp_eval_ctm_patch
 ```
@@ -78,7 +88,7 @@ bash scripts/run_patch_minimal_ctm_server.sh ./data/imagenet_real ./outputs/wgcp
 - `GLOBAL_REPLACEMENT_MODE=hard|fused|adaptive_ms`
 - `PATCH_REPLACEMENT_MODE=hard|fused|adaptive_ms`
 
-纯频域升级对照（不使用 patch，推荐用于验证你提出的方案 A / A+B）：
+纯频域 AWDD 对照（不使用 patch）：
 
 ```bash
 MAX_IMAGES=100 \
@@ -90,8 +100,8 @@ bash scripts/run_ms_adaptive_minimal_ctm_server.sh ./data/imagenet_real ./output
 该脚本固定运行 3 组：
 
 1. `G0_level1_hard`：当前 level-1 硬替换基线
-2. `G1_ms_decouple_hardhf`：方案 A（深层小波解耦）
-3. `G2_ms_adaptive`：方案 A+B（多尺度自适应融合）
+2. `G1_awdd_ll_pred_only`：AWDD strict（纯 CTM 低频）
+3. `G2_awdd_soft_anchor`：AWDD strict + 低频软锚定（推荐）
 
 若要启用多尺度自适应融合（adaptive_ms），可在命令末尾追加：
 
@@ -107,7 +117,8 @@ bash scripts/run_ms_adaptive_minimal_ctm_server.sh ./data/imagenet_real ./output
 当前脚本默认关键参数：
 
 - `self_correct_k=0`
-- `replacement_mode=hard`
+- `wavelet=db4`
+- `replacement_mode=adaptive_ms`
 - `t_star=40`
 - `min_clean_conf=0.05`
 

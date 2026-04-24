@@ -30,7 +30,8 @@ MAX_IMAGES="${MAX_IMAGES:-100}"
 MIN_CLEAN_CONF="${MIN_CLEAN_CONF:-0.05}"
 SAVE_DETAIL_EVERY="${SAVE_DETAIL_EVERY:-10}"
 GLOB_PATTERN="${GLOB_PATTERN:-*.JPEG}"
-GLOBAL_REPLACEMENT_MODE="${GLOBAL_REPLACEMENT_MODE:-hard}"
+WAVELET="${WAVELET:-db4}"
+GLOBAL_REPLACEMENT_MODE="${GLOBAL_REPLACEMENT_MODE:-adaptive_ms}"
 PATCH_REPLACEMENT_MODE="${PATCH_REPLACEMENT_MODE:-adaptive_ms}"
 
 # Patch-WGCP defaults (main case uses these unless overridden)
@@ -45,7 +46,7 @@ MS_LEVELS="${MS_LEVELS:-3}"
 MS_GAMMA_LEVELS="${MS_GAMMA_LEVELS:-1.6,1.2,0.9}"
 MS_W_MIN="${MS_W_MIN:-0.05}"
 MS_W_MAX="${MS_W_MAX:-0.95}"
-MS_LL_ALPHA="${MS_LL_ALPHA:-0.1}"
+MS_LL_ALPHA="${MS_LL_ALPHA:-0.08}"
 MS_EPS="${MS_EPS:-1e-6}"
 
 PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE')}))")"
@@ -57,6 +58,7 @@ echo "  output root: $OUTPUT_ROOT"
 echo "  glob: $GLOB_PATTERN"
 echo "  max_images: $MAX_IMAGES"
 echo "  save_detail_every: $SAVE_DETAIL_EVERY"
+echo "  wavelet: $WAVELET"
 echo "  global_replacement_mode: $GLOBAL_REPLACEMENT_MODE"
 echo "  patch_replacement_mode: $PATCH_REPLACEMENT_MODE"
 echo "  predictor_module: $PREDICTOR_MODULE"
@@ -87,6 +89,7 @@ run_case() {
     --predictor_module "$PREDICTOR_MODULE" \
     --predictor_kwargs_json "$PREDICTOR_KWARGS" \
     --predictor_image_size "$PREDICTOR_IMAGE_SIZE" \
+    --wavelet "$WAVELET" \
     --t_star 40 \
     --self_correct_k 0 \
     --ablation_ll_source orig \

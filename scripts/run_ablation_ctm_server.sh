@@ -32,6 +32,7 @@ HF_PRESERVE="${HF_PRESERVE:-0.35}"
 HF_SHRINK="${HF_SHRINK:-0.6}"
 GLOB_PATTERN="${GLOB_PATTERN:-*.JPEG}"
 SAVE_DETAIL_EVERY="${SAVE_DETAIL_EVERY:-10}"
+WAVELET="${WAVELET:-db4}"
 PATCH_MODE="${PATCH_MODE:-0}"
 PATCH_SIZE="${PATCH_SIZE:-64}"
 PATCH_STRIDE="${PATCH_STRIDE:-32}"
@@ -48,6 +49,7 @@ echo "  env: $CAMP_ENV"
 echo "  input: $INPUT_DIR"
 echo "  output root: $OUTPUT_ROOT"
 echo "  glob: $GLOB_PATTERN"
+echo "  wavelet: $WAVELET"
 echo "  save_detail_every: $SAVE_DETAIL_EVERY"
 echo "  patch_mode: $PATCH_MODE"
 echo "  ctm repo: $CTM_REPO"
@@ -88,6 +90,7 @@ run_case() {
     --predictor_module "$PREDICTOR_MODULE" \
     --predictor_kwargs_json "$PREDICTOR_KWARGS" \
     --predictor_image_size "$PREDICTOR_IMAGE_SIZE" \
+    --wavelet "$WAVELET" \
     --max_images "$MAX_IMAGES" \
     --glob "$GLOB_PATTERN" \
     --min_clean_conf "$MIN_CLEAN_CONF" \

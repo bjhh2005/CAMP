@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 
 Tensor = torch.Tensor
+WAVELET_MODE = "reflect"
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clean_dir", type=Path, default=None, help="Optional clean-image directory for metrics")
     parser.add_argument("--max_images", type=int, default=4)
     parser.add_argument("--glob", type=str, default="*.png")
-    parser.add_argument("--wavelet", type=str, default="haar")
+    parser.add_argument("--wavelet", type=str, default="db4")
     parser.add_argument("--num_diffusion_steps", type=int, default=1000)
     parser.add_argument("--t_star", type=int, default=40)
     parser.add_argument("--self_correct_k", type=int, default=1)
@@ -94,9 +95,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--replacement_mode",
         type=str,
-        default="hard",
+        default="adaptive_ms",
         choices=["hard", "fused", "adaptive_ms"],
-        help="HF replacement strategy: hard / fused / adaptive multi-scale fusion",
+        help="HF replacement strategy: hard / fused / adaptive multi-scale soft-shrinkage",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -117,17 +118,17 @@ def parse_args() -> argparse.Namespace:
         "--ms_gamma_levels",
         type=str,
         default="1.6,1.2,0.9",
-        help="Gamma schedule for adaptive_ms by level1->L (comma separated).",
+        help="Gamma schedule for adaptive_ms soft-shrinkage by level1->L (comma separated).",
     )
-    parser.add_argument("--ms_w_min", type=float, default=0.05, help="Lower clamp for adaptive_ms mask.")
-    parser.add_argument("--ms_w_max", type=float, default=0.95, help="Upper clamp for adaptive_ms mask.")
+    parser.add_argument("--ms_w_min", type=float, default=0.05, help="Legacy no-op for adaptive_ms (kept for CLI compatibility).")
+    parser.add_argument("--ms_w_max", type=float, default=0.95, help="Legacy no-op for adaptive_ms (kept for CLI compatibility).")
     parser.add_argument(
         "--ms_ll_alpha",
         type=float,
-        default=0.1,
-        help="Deep LL blend alpha in adaptive_ms: LL=(1-a)*LL_orig + a*LL_pred.",
+        default=0.08,
+        help="Deep LL blend alpha in adaptive_ms: LL=(1-a)*LL_pred + a*LL_orig.",
     )
-    parser.add_argument("--ms_eps", type=float, default=1e-6, help="Numerical epsilon for adaptive_ms.")
+    parser.add_argument("--ms_eps", type=float, default=1e-6, help="Numerical epsilon used in MAD estimation for adaptive_ms.")
     parser.add_argument("--patch_mode", action="store_true", help="Enable Patch-WGCP purification pipeline.")
     parser.add_argument("--patch_size", type=int, default=64, help="Patch size for Patch-WGCP.")
     parser.add_argument("--patch_stride", type=int, default=32, help="Patch stride for Patch-WGCP.")
@@ -292,7 +293,7 @@ def dwt2_rgb_tensor(x_chw: Tensor, wavelet: str) -> Tuple[Tensor, Dict[str, Tens
     x_np = x_chw.detach().cpu().numpy()
     ll_list, hl_list, lh_list, hh_list = [], [], [], []
     for c in range(x_np.shape[0]):
-        ll, (ch, cv, cd) = pywt.dwt2(x_np[c], wavelet=wavelet, mode="periodization")
+        ll, (ch, cv, cd) = pywt.dwt2(x_np[c], wavelet=wavelet, mode=WAVELET_MODE)
         ll_list.append(ll)
         # pywt returns (cH, cV, cD). We map to HL/LH/HH naming for paper notation.
         hl_list.append(ch)
@@ -320,7 +321,7 @@ def idwt2_rgb_tensor(
 
     rec_list = []
     for c in range(ll_np.shape[0]):
-        rec = pywt.idwt2((ll_np[c], (hl_np[c], lh_np[c], hh_np[c])), wavelet=wavelet, mode="periodization")
+        rec = pywt.idwt2((ll_np[c], (hl_np[c], lh_np[c], hh_np[c])), wavelet=wavelet, mode=WAVELET_MODE)
         rec_list.append(rec)
     rec_t = torch.from_numpy(np.stack(rec_list, axis=0)).float()
     if target_hw is not None:
@@ -362,7 +363,7 @@ def wavedec2_rgb_tensor(
         lvl: {"HL": [], "LH": [], "HH": []} for lvl in range(1, use_levels + 1)
     }
     for c in range(x_np.shape[0]):
-        coeffs = pywt.wavedec2(x_np[c], wavelet=wavelet, mode="periodization", level=use_levels)
+        coeffs = pywt.wavedec2(x_np[c], wavelet=wavelet, mode=WAVELET_MODE, level=use_levels)
         ll_list.append(coeffs[0])
         # coeffs[1] is level=use_levels, coeffs[use_levels] is level=1
         for lvl in range(1, use_levels + 1):
@@ -406,7 +407,7 @@ def waverec2_rgb_tensor(
                     bands["HH"][c],
                 )
             )
-        rec = pywt.waverec2(coeffs, wavelet=wavelet, mode="periodization")
+        rec = pywt.waverec2(coeffs, wavelet=wavelet, mode=WAVELET_MODE)
         rec_list.append(rec)
     rec_t = torch.from_numpy(np.stack(rec_list, axis=0)).float()
     if target_hw is not None:
@@ -440,13 +441,13 @@ def adaptive_multiscale_fusion(
     target_hw: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Tensor, Dict[str, object]]:
     ll_orig, hf_orig_levels, use_levels = wavedec2_rgb_tensor(x_orig_chw, wavelet=wavelet, levels=levels)
-    ll_pred, hf_pred_levels, _ = wavedec2_rgb_tensor(x_pred_chw, wavelet=wavelet, levels=use_levels)
+    ll_pred, _, _ = wavedec2_rgb_tensor(x_pred_chw, wavelet=wavelet, levels=use_levels)
     gamma_sched = resolve_ms_gamma_schedule(use_levels, gamma_text)
 
-    w_lo = float(min(w_min, w_max))
-    w_hi = float(max(w_min, w_max))
+    # AWDD v2.1 strict: predictor is only used for deep semantic LL.
+    # HF is purified from original coefficients via subband-wise soft-shrinkage.
     ll_a = float(np.clip(ll_alpha, 0.0, 1.0))
-    ll_final = (1.0 - ll_a) * ll_orig + ll_a * ll_pred
+    ll_final = (1.0 - ll_a) * ll_pred + ll_a * ll_orig
 
     hf_final_levels: Dict[int, Dict[str, Tensor]] = {}
     level_stats: Dict[str, Dict[str, float]] = {}
@@ -456,27 +457,27 @@ def adaptive_multiscale_fusion(
         hf_final_levels[lvl] = {}
         for band in ("HL", "LH", "HH"):
             orig = hf_orig_levels[lvl][band]
-            pred = hf_pred_levels[lvl][band]
-            residual = orig - pred
-            mad = median_abs_deviation(residual, eps=eps)
-            norm_diff = residual.abs() / mad.unsqueeze(-1).unsqueeze(-1)
-            weight = torch.exp(-gamma * norm_diff).clamp(w_lo, w_hi)
-            fused = weight * orig + (1.0 - weight) * pred
-            hf_final_levels[lvl][band] = fused
-            lvl_stats[f"w_mean_{band}"] = float(weight.mean().item())
+            mad = median_abs_deviation(orig, eps=eps)
+            sigma = mad / 0.6745
+            n_coeff = max(2.0, float(orig.shape[-2] * orig.shape[-1]))
+            tau = gamma * sigma * math.sqrt(2.0 * math.log(n_coeff))
+            hf_final_levels[lvl][band] = soft_shrink(orig, tau)
+            lvl_stats[f"sigma_mean_{band}"] = float(sigma.mean().item())
+            lvl_stats[f"tau_mean_{band}"] = float(tau.mean().item())
         level_stats[f"L{lvl}"] = lvl_stats
 
     x_rec = waverec2_rgb_tensor(ll_final, hf_final_levels, wavelet=wavelet, target_hw=target_hw)
     meta: Dict[str, object] = {
         "levels": int(use_levels),
         "gamma_schedule": {f"L{k}": float(v) for k, v in gamma_sched.items()},
-        "w_min": float(w_lo),
-        "w_max": float(w_hi),
+        "legacy_w_min": float(min(w_min, w_max)),
+        "legacy_w_max": float(max(w_min, w_max)),
         "ll_alpha": float(ll_a),
         "level_stats": level_stats,
         "ll_final": ll_final,
         "hf_final_levels": hf_final_levels,
         "ll_pred": ll_pred,
+        "hf_policy": "orig_soft_shrink_only",
     }
     return x_rec, meta
 
@@ -724,7 +725,7 @@ def _purify_adv_tensor_global(
     ms_gamma_levels: str = "1.6,1.2,0.9",
     ms_w_min: float = 0.05,
     ms_w_max: float = 0.95,
-    ms_ll_alpha: float = 0.1,
+    ms_ll_alpha: float = 0.08,
     ms_eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     if x_adv.ndim != 4 or x_adv.shape[0] != 1:
@@ -742,7 +743,7 @@ def _purify_adv_tensor_global(
 
     ll_hat, hf_hat = dwt2_rgb_tensor(x0_hat[0], wavelet=wavelet)
     adaptive_meta: Dict[str, object] | None = None
-    # CAMP default: keep LL from x_adv (ll_orig) and use predictor HF under hard replacement.
+    # Hard/fused modes keep legacy behavior; adaptive_ms follows AWDD v2.1 strict fusion.
     if replacement_mode == "hard":
         ll_anchor = ll_orig if ablation_ll_source == "orig" else ll_hat
         hf_selected = hf_hat if ablation_hard_hf_source == "pred" else hf_orig
@@ -870,7 +871,7 @@ def purify_adv_tensor(
     ms_gamma_levels: str = "1.6,1.2,0.9",
     ms_w_min: float = 0.05,
     ms_w_max: float = 0.95,
-    ms_ll_alpha: float = 0.1,
+    ms_ll_alpha: float = 0.08,
     ms_eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     """

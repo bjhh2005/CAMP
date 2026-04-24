@@ -30,12 +30,11 @@ MAX_IMAGES="${MAX_IMAGES:-100}"
 MIN_CLEAN_CONF="${MIN_CLEAN_CONF:-0.05}"
 SAVE_DETAIL_EVERY="${SAVE_DETAIL_EVERY:-10}"
 GLOB_PATTERN="${GLOB_PATTERN:-*.JPEG}"
+WAVELET="${WAVELET:-db4}"
 
 MS_LEVELS="${MS_LEVELS:-3}"
 MS_GAMMA_LEVELS="${MS_GAMMA_LEVELS:-1.6,1.2,0.9}"
-MS_W_MIN="${MS_W_MIN:-0.05}"
-MS_W_MAX="${MS_W_MAX:-0.95}"
-MS_LL_ALPHA="${MS_LL_ALPHA:-0.1}"
+MS_LL_ALPHA="${MS_LL_ALPHA:-0.08}"
 MS_EPS="${MS_EPS:-1e-6}"
 
 PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE')}))")"
@@ -47,6 +46,7 @@ echo "  output root: $OUTPUT_ROOT"
 echo "  glob: $GLOB_PATTERN"
 echo "  max_images: $MAX_IMAGES"
 echo "  save_detail_every: $SAVE_DETAIL_EVERY"
+echo "  wavelet: $WAVELET"
 echo "  ms_levels: $MS_LEVELS"
 echo "  ms_gamma_levels: $MS_GAMMA_LEVELS"
 echo "  ctm repo: $CTM_REPO"
@@ -76,6 +76,7 @@ run_case() {
     --predictor_module "$PREDICTOR_MODULE" \
     --predictor_kwargs_json "$PREDICTOR_KWARGS" \
     --predictor_image_size "$PREDICTOR_IMAGE_SIZE" \
+    --wavelet "$WAVELET" \
     --t_star 40 \
     --self_correct_k 0 \
     --ablation_ll_source orig \
@@ -91,25 +92,21 @@ run_case "G0_level1_hard" \
   --device cuda \
   --replacement_mode hard
 
-# 2) Scheme A: multi-level decoupling (keep deep LL_orig, replace all higher bands by pred)
-run_case "G1_ms_decouple_hardhf" \
+# 2) AWDD strict (LL from predictor only)
+run_case "G1_awdd_ll_pred_only" \
   --device cuda \
   --replacement_mode adaptive_ms \
   --ms_levels "$MS_LEVELS" \
   --ms_gamma_levels "$MS_GAMMA_LEVELS" \
-  --ms_w_min 0.0 \
-  --ms_w_max 0.0 \
   --ms_ll_alpha 0.0 \
   --ms_eps "$MS_EPS"
 
-# 3) Scheme A+B: multi-level adaptive shrinkage fusion
-run_case "G2_ms_adaptive" \
+# 3) AWDD strict + soft low-frequency anchor
+run_case "G2_awdd_soft_anchor" \
   --device cuda \
   --replacement_mode adaptive_ms \
   --ms_levels "$MS_LEVELS" \
   --ms_gamma_levels "$MS_GAMMA_LEVELS" \
-  --ms_w_min "$MS_W_MIN" \
-  --ms_w_max "$MS_W_MAX" \
   --ms_ll_alpha "$MS_LL_ALPHA" \
   --ms_eps "$MS_EPS"
 

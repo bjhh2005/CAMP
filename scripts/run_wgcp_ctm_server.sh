@@ -37,6 +37,12 @@ PATCH_WEIGHT_SIGMA="${PATCH_WEIGHT_SIGMA:-0}"
 PATCH_LOWFREQ_ALPHA="${PATCH_LOWFREQ_ALPHA:-0.1}"
 PATCH_LL_SOURCE="${PATCH_LL_SOURCE:-hat}"
 PATCH_PAD_MODE="${PATCH_PAD_MODE:-reflect}"
+WAVELET="${WAVELET:-db4}"
+REPLACEMENT_MODE="${REPLACEMENT_MODE:-adaptive_ms}"
+MS_LEVELS="${MS_LEVELS:-3}"
+MS_GAMMA_LEVELS="${MS_GAMMA_LEVELS:-1.6,1.2,0.9}"
+MS_LL_ALPHA="${MS_LL_ALPHA:-0.08}"
+MS_EPS="${MS_EPS:-1e-6}"
 
 PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE')}))")"
 
@@ -50,6 +56,8 @@ echo "  lightweight_mode: $LIGHTWEIGHT_MODE"
 echo "  save_reference_every: $SAVE_REFERENCE_EVERY"
 echo "  reference_dir: ${REFERENCE_DIR:-<default>}"
 echo "  patch_mode: $PATCH_MODE"
+echo "  wavelet: $WAVELET"
+echo "  replacement_mode: $REPLACEMENT_MODE"
 echo "  ctm repo: $CTM_REPO"
 echo "  ckpt: $CTM_CKPT"
 
@@ -82,9 +90,14 @@ EVAL_ARGS=(
   --predictor_module "$PREDICTOR_MODULE"
   --predictor_kwargs_json "$PREDICTOR_KWARGS"
   --predictor_image_size "$PREDICTOR_IMAGE_SIZE"
+  --wavelet "$WAVELET"
   --t_star 40
   --self_correct_k 0
-  --replacement_mode hard
+  --replacement_mode "$REPLACEMENT_MODE"
+  --ms_levels "$MS_LEVELS"
+  --ms_gamma_levels "$MS_GAMMA_LEVELS"
+  --ms_ll_alpha "$MS_LL_ALPHA"
+  --ms_eps "$MS_EPS"
   --min_clean_conf 0.05
 )
 

@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pgd_steps", type=int, default=10)
     parser.add_argument("--pgd_alpha", type=float, default=2.0 / 255.0)
 
-    parser.add_argument("--wavelet", type=str, default="haar")
+    parser.add_argument("--wavelet", type=str, default="db4")
     parser.add_argument("--num_diffusion_steps", type=int, default=1000)
     parser.add_argument("--t_star", type=int, default=40)
     parser.add_argument("--self_correct_k", type=int, default=1)
@@ -176,9 +176,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--replacement_mode",
         type=str,
-        default="hard",
+        default="adaptive_ms",
         choices=["hard", "fused", "adaptive_ms"],
-        help="HF replacement strategy: hard / fused / adaptive multi-scale fusion",
+        help="HF replacement strategy: hard / fused / adaptive multi-scale soft-shrinkage",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -199,17 +199,17 @@ def parse_args() -> argparse.Namespace:
         "--ms_gamma_levels",
         type=str,
         default="1.6,1.2,0.9",
-        help="Gamma schedule for adaptive_ms by level1->L (comma separated).",
+        help="Gamma schedule for adaptive_ms soft-shrinkage by level1->L (comma separated).",
     )
-    parser.add_argument("--ms_w_min", type=float, default=0.05, help="Lower clamp for adaptive_ms mask.")
-    parser.add_argument("--ms_w_max", type=float, default=0.95, help="Upper clamp for adaptive_ms mask.")
+    parser.add_argument("--ms_w_min", type=float, default=0.05, help="Legacy no-op for adaptive_ms (kept for CLI compatibility).")
+    parser.add_argument("--ms_w_max", type=float, default=0.95, help="Legacy no-op for adaptive_ms (kept for CLI compatibility).")
     parser.add_argument(
         "--ms_ll_alpha",
         type=float,
-        default=0.1,
-        help="Deep LL blend alpha in adaptive_ms: LL=(1-a)*LL_orig + a*LL_pred.",
+        default=0.08,
+        help="Deep LL blend alpha in adaptive_ms: LL=(1-a)*LL_pred + a*LL_orig.",
     )
-    parser.add_argument("--ms_eps", type=float, default=1e-6, help="Numerical epsilon for adaptive_ms.")
+    parser.add_argument("--ms_eps", type=float, default=1e-6, help="Numerical epsilon used in MAD estimation for adaptive_ms.")
     parser.add_argument("--patch_mode", action="store_true", help="Enable Patch-WGCP purification pipeline.")
     parser.add_argument("--patch_size", type=int, default=64, help="Patch size for Patch-WGCP.")
     parser.add_argument("--patch_stride", type=int, default=32, help="Patch stride for Patch-WGCP.")
