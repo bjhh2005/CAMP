@@ -27,10 +27,28 @@ class ScaledDotProduct(nn.Module):
         self.scale = scale
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, att_mask=None, **kwargs) -> torch.Tensor:
-        # Accept [B,N,H,D] and [B,H,N,D]-like inputs.
+        # CTM callsites may pass:
+        #  - 3D: [B*H, N, D]
+        #  - 4D: [B, N, H, D] or [B, H, N, D]
+        # Keep output rank aligned with input rank.
+        if q.ndim == 3 and k.ndim == 3 and v.ndim == 3:
+            scale = self.scale
+            if scale is None:
+                scale = 1.0 / math.sqrt(float(q.shape[-1]))
+            q_scaled = q * float(scale)
+            return F.scaled_dot_product_attention(
+                q_scaled,
+                k,
+                v,
+                attn_mask=att_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=self.causal,
+            )
+
+        # Accept [B,N,H,D] and [B,H,N,D]-like 4D inputs.
         def to_bhnd(x: torch.Tensor) -> torch.Tensor:
             if x.ndim != 4:
-                raise ValueError(f"ScaledDotProduct expects 4D tensors, got {x.shape}")
+                raise ValueError(f"ScaledDotProduct expects 3D/4D tensors, got {x.shape}")
             # Heuristic: if dim1 looks like sequence, assume [B,N,H,D].
             if x.shape[1] >= x.shape[2]:
                 return x.permute(0, 2, 1, 3).contiguous()
@@ -55,4 +73,3 @@ class ScaledDotProduct(nn.Module):
         )
         # Return [B,N,H,D] to match xformers-style conventions.
         return out.permute(0, 2, 1, 3).contiguous()
-
