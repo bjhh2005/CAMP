@@ -108,7 +108,13 @@ class CTMRepoPredictor:
                 "start_scales": int(start_scales),
                 "inner_parametrization": inner_parametrization,
                 "outer_parametrization": outer_parametrization,
-                "attention_type": attention_type,
+                # flash-attn path in sony/ctm expects fp16/bf16 qkv.
+                # Fall back to a non-flash attention backend when fp16 is disabled.
+                "attention_type": (
+                    attention_type
+                    if bool(use_fp16 and self.device.type == "cuda") or attention_type != "flash"
+                    else "xformer"
+                ),
                 "target_subtract": False,
                 "rescaling": False,
             }
@@ -141,8 +147,13 @@ class CTMRepoPredictor:
                 )
 
         self.model.to(self.device)
-        if getattr(self.args, "use_fp16", False) and hasattr(self.model, "convert_to_fp16"):
-            self.model.convert_to_fp16()
+        self.use_fp16 = bool(getattr(self.args, "use_fp16", False) and self.device.type == "cuda")
+        if self.use_fp16:
+            if hasattr(self.model, "convert_to_fp16"):
+                self.model.convert_to_fp16()
+            else:
+                self.model.half()
+        self.compute_dtype = torch.float16 if self.use_fp16 else torch.float32
         self.model.eval()
 
     def set_class_label(self, class_label: int) -> None:
@@ -161,7 +172,7 @@ class CTMRepoPredictor:
     def __call__(self, x_t: torch.Tensor, t_index: int) -> torch.Tensor:
         if x_t.ndim != 4:
             raise ValueError("x_t must be [B,C,H,W]")
-        x_t = x_t.to(self.device)
+        x_t = x_t.to(device=self.device, dtype=self.compute_dtype)
         bsz = x_t.shape[0]
 
         # CAMP code uses [0,1]; CTM code expects [-1,1].
@@ -189,5 +200,4 @@ class CTMRepoPredictor:
         # For CTM transition t->s, G_theta corresponds to the destination state.
         x0 = g_theta
         x0 = (x0 + 1.0) / 2.0
-        return x0.clamp(0.0, 1.0)
-
+        return x0.float().clamp(0.0, 1.0)
