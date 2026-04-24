@@ -153,6 +153,9 @@ class CTMRepoPredictor:
                 self.model.convert_to_fp16()
             else:
                 self.model.half()
+            # Some CTM branches keep the output head in fp32 after convert_to_fp16(),
+            # which can cause conv bias dtype mismatch at inference. Force a uniform dtype.
+            self.model.to(dtype=torch.float16)
         self.compute_dtype = torch.float16 if self.use_fp16 else torch.float32
         self.model.eval()
 
