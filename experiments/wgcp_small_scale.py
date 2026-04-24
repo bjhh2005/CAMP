@@ -96,8 +96,8 @@ def parse_args() -> argparse.Namespace:
         "--replacement_mode",
         type=str,
         default="adaptive_ms",
-        choices=["hard", "fused", "adaptive_ms"],
-        help="HF replacement strategy: hard / fused / adaptive multi-scale soft-shrinkage",
+        choices=["hard", "fused", "adaptive_ms", "adaptive_ms_guided"],
+        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -120,8 +120,18 @@ def parse_args() -> argparse.Namespace:
         default="1.6,1.2,0.9",
         help="Gamma schedule for adaptive_ms soft-shrinkage by level1->L (comma separated).",
     )
-    parser.add_argument("--ms_w_min", type=float, default=0.05, help="Legacy no-op for adaptive_ms (kept for CLI compatibility).")
-    parser.add_argument("--ms_w_max", type=float, default=0.95, help="Legacy no-op for adaptive_ms (kept for CLI compatibility).")
+    parser.add_argument(
+        "--ms_w_min",
+        type=float,
+        default=0.05,
+        help="Minimum predictor weight used by guided adaptive multi-scale LL fusion.",
+    )
+    parser.add_argument(
+        "--ms_w_max",
+        type=float,
+        default=0.95,
+        help="Maximum predictor weight used by guided adaptive multi-scale LL fusion.",
+    )
     parser.add_argument(
         "--ms_ll_alpha",
         type=float,
@@ -129,6 +139,36 @@ def parse_args() -> argparse.Namespace:
         help="Deep LL blend alpha in adaptive_ms: LL=(1-a)*LL_pred + a*LL_orig.",
     )
     parser.add_argument("--ms_eps", type=float, default=1e-6, help="Numerical epsilon used in MAD estimation for adaptive_ms.")
+    parser.add_argument(
+        "--ms_ll_gate_tau",
+        type=float,
+        default=0.75,
+        help="Guided mode LL gate center; larger values make predictor LL injection more conservative.",
+    )
+    parser.add_argument(
+        "--ms_ll_gate_gain",
+        type=float,
+        default=4.0,
+        help="Guided mode LL gate sharpness; larger values make LL switching more selective.",
+    )
+    parser.add_argument(
+        "--ms_hf_pred_levels",
+        type=str,
+        default="0.20,0.12,0.08",
+        help="Guided mode predictor HF residual mix schedule by level1->L (comma separated).",
+    )
+    parser.add_argument(
+        "--ms_hf_gate_tau",
+        type=float,
+        default=0.5,
+        help="Guided mode HF gate center for predictor residual reinjection.",
+    )
+    parser.add_argument(
+        "--ms_hf_gate_gain",
+        type=float,
+        default=4.0,
+        help="Guided mode HF gate sharpness for predictor residual reinjection.",
+    )
     parser.add_argument("--patch_mode", action="store_true", help="Enable Patch-WGCP purification pipeline.")
     parser.add_argument("--patch_size", type=int, default=64, help="Patch size for Patch-WGCP.")
     parser.add_argument("--patch_stride", type=int, default=32, help="Patch stride for Patch-WGCP.")
@@ -335,10 +375,10 @@ def idwt2_rgb_tensor(
     return rec_t
 
 
-def resolve_ms_gamma_schedule(levels: int, gamma_text: str) -> Dict[int, float]:
-    parts = [x.strip() for x in gamma_text.split(",") if x.strip()]
+def resolve_level_schedule(levels: int, values_text: str, fallback: float) -> Dict[int, float]:
+    parts = [x.strip() for x in values_text.split(",") if x.strip()]
     if not parts:
-        vals = [1.0]
+        vals = [float(fallback)]
     else:
         vals = [float(x) for x in parts]
     out: Dict[int, float] = {}
@@ -346,6 +386,10 @@ def resolve_ms_gamma_schedule(levels: int, gamma_text: str) -> Dict[int, float]:
         idx = min(lvl - 1, len(vals) - 1)
         out[lvl] = float(vals[idx])
     return out
+
+
+def resolve_ms_gamma_schedule(levels: int, gamma_text: str) -> Dict[int, float]:
+    return resolve_level_schedule(levels, gamma_text, fallback=1.0)
 
 
 def wavedec2_rgb_tensor(
@@ -428,6 +472,19 @@ def median_abs_deviation(coeff: Tensor, eps: float = 1e-6) -> Tensor:
     return mad.clamp_min(eps)
 
 
+def expand_channel_stat(stat: Tensor, coeff: Tensor) -> Tensor:
+    view = stat
+    while view.ndim < coeff.ndim:
+        view = view.unsqueeze(-1)
+    return view
+
+
+def normalized_gate_map(delta: Tensor, scale: Tensor, gate_tau: float, gate_gain: float) -> Tensor:
+    scale_map = expand_channel_stat(scale.clamp_min(1e-6), delta)
+    score = delta.abs() / scale_map
+    return torch.sigmoid(float(gate_gain) * (score - float(gate_tau)))
+
+
 def adaptive_multiscale_fusion(
     x_orig_chw: Tensor,
     x_pred_chw: Tensor,
@@ -478,6 +535,97 @@ def adaptive_multiscale_fusion(
         "hf_final_levels": hf_final_levels,
         "ll_pred": ll_pred,
         "hf_policy": "orig_soft_shrink_only",
+    }
+    return x_rec, meta
+
+
+def adaptive_multiscale_guided_fusion(
+    x_orig_chw: Tensor,
+    x_pred_chw: Tensor,
+    wavelet: str,
+    levels: int,
+    gamma_text: str,
+    w_min: float,
+    w_max: float,
+    ll_gate_tau: float,
+    ll_gate_gain: float,
+    hf_pred_levels: str,
+    hf_gate_tau: float,
+    hf_gate_gain: float,
+    eps: float = 1e-6,
+    target_hw: Optional[Tuple[int, int]] = None,
+) -> Tuple[Tensor, Dict[str, object]]:
+    ll_orig, hf_orig_levels, use_levels = wavedec2_rgb_tensor(x_orig_chw, wavelet=wavelet, levels=levels)
+    ll_pred, hf_pred_levels_map, _ = wavedec2_rgb_tensor(x_pred_chw, wavelet=wavelet, levels=use_levels)
+    gamma_sched = resolve_ms_gamma_schedule(use_levels, gamma_text)
+    pred_mix_sched = resolve_level_schedule(use_levels, hf_pred_levels, fallback=0.0)
+
+    w_lo = float(np.clip(min(w_min, w_max), 0.0, 1.0))
+    w_hi = float(np.clip(max(w_min, w_max), 0.0, 1.0))
+    ll_delta = ll_pred - ll_orig
+    ll_scale = median_abs_deviation(ll_delta, eps=eps) / 0.6745
+    ll_gate = normalized_gate_map(ll_delta, ll_scale, gate_tau=ll_gate_tau, gate_gain=ll_gate_gain)
+    ll_weight = w_lo + (w_hi - w_lo) * ll_gate
+    ll_final = (1.0 - ll_weight) * ll_orig + ll_weight * ll_pred
+
+    hf_final_levels: Dict[int, Dict[str, Tensor]] = {}
+    level_stats: Dict[str, Dict[str, float]] = {}
+    for lvl in range(1, use_levels + 1):
+        gamma = float(gamma_sched[lvl])
+        pred_mix_base = float(np.clip(pred_mix_sched[lvl], 0.0, 1.0))
+        lvl_stats: Dict[str, float] = {
+            "gamma": gamma,
+            "pred_mix_base": pred_mix_base,
+        }
+        hf_final_levels[lvl] = {}
+        for band in ("HL", "LH", "HH"):
+            orig = hf_orig_levels[lvl][band]
+            pred = hf_pred_levels_map[lvl][band]
+
+            mad_orig = median_abs_deviation(orig, eps=eps)
+            sigma_orig = mad_orig / 0.6745
+            n_coeff = max(2.0, float(orig.shape[-2] * orig.shape[-1]))
+            tau = gamma * sigma_orig * math.sqrt(2.0 * math.log(n_coeff))
+            orig_denoised = soft_shrink(orig, tau)
+            pred_denoised = soft_shrink(pred, tau)
+
+            delta_scale = median_abs_deviation(pred - orig, eps=eps) / 0.6745
+            hf_gate = normalized_gate_map(
+                pred_denoised - orig_denoised,
+                delta_scale,
+                gate_tau=hf_gate_tau,
+                gate_gain=hf_gate_gain,
+            )
+            sign_agree = (orig * pred > 0).float()
+            stronger_pred = (pred_denoised.abs() > orig_denoised.abs()).float()
+            mix_map = pred_mix_base * hf_gate * sign_agree * stronger_pred
+            hf_final = orig_denoised + mix_map * (pred_denoised - orig_denoised)
+            hf_final_levels[lvl][band] = hf_final
+
+            lvl_stats[f"sigma_mean_{band}"] = float(sigma_orig.mean().item())
+            lvl_stats[f"tau_mean_{band}"] = float(tau.mean().item())
+            lvl_stats[f"gate_mean_{band}"] = float(hf_gate.mean().item())
+            lvl_stats[f"mix_mean_{band}"] = float(mix_map.mean().item())
+            lvl_stats[f"sign_agree_ratio_{band}"] = float(sign_agree.mean().item())
+        level_stats[f"L{lvl}"] = lvl_stats
+
+    x_rec = waverec2_rgb_tensor(ll_final, hf_final_levels, wavelet=wavelet, target_hw=target_hw)
+    meta: Dict[str, object] = {
+        "levels": int(use_levels),
+        "gamma_schedule": {f"L{k}": float(v) for k, v in gamma_sched.items()},
+        "pred_mix_schedule": {f"L{k}": float(v) for k, v in pred_mix_sched.items()},
+        "ll_weight_bounds": {"min": w_lo, "max": w_hi},
+        "ll_gate_tau": float(ll_gate_tau),
+        "ll_gate_gain": float(ll_gate_gain),
+        "hf_gate_tau": float(hf_gate_tau),
+        "hf_gate_gain": float(hf_gate_gain),
+        "ll_weight_mean": float(ll_weight.mean().item()),
+        "ll_gate_mean": float(ll_gate.mean().item()),
+        "level_stats": level_stats,
+        "ll_final": ll_final,
+        "hf_final_levels": hf_final_levels,
+        "ll_pred": ll_pred,
+        "hf_policy": "orig_soft_shrink_plus_guided_pred_residual",
     }
     return x_rec, meta
 
@@ -727,6 +875,11 @@ def _purify_adv_tensor_global(
     ms_w_max: float = 0.95,
     ms_ll_alpha: float = 0.08,
     ms_eps: float = 1e-6,
+    ms_ll_gate_tau: float = 0.75,
+    ms_ll_gate_gain: float = 4.0,
+    ms_hf_pred_levels: str = "0.20,0.12,0.08",
+    ms_hf_gate_tau: float = 0.5,
+    ms_hf_gate_gain: float = 4.0,
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     if x_adv.ndim != 4 or x_adv.shape[0] != 1:
         raise ValueError("x_adv must have shape [1, C, H, W]")
@@ -767,6 +920,25 @@ def _purify_adv_tensor_global(
         )
         ll_anchor = adaptive_meta["ll_final"]
         hf_selected = dwt2_rgb_tensor(x_first, wavelet=wavelet)[1]
+    elif replacement_mode == "adaptive_ms_guided":
+        x_first, adaptive_meta = adaptive_multiscale_guided_fusion(
+            x_orig_chw=x_adv[0],
+            x_pred_chw=x0_hat[0],
+            wavelet=wavelet,
+            levels=ms_levels,
+            gamma_text=ms_gamma_levels,
+            w_min=ms_w_min,
+            w_max=ms_w_max,
+            ll_gate_tau=ms_ll_gate_tau,
+            ll_gate_gain=ms_ll_gate_gain,
+            hf_pred_levels=ms_hf_pred_levels,
+            hf_gate_tau=ms_hf_gate_tau,
+            hf_gate_gain=ms_hf_gate_gain,
+            eps=ms_eps,
+            target_hw=target_hw,
+        )
+        ll_anchor = adaptive_meta["ll_final"]
+        hf_selected = dwt2_rgb_tensor(x_first, wavelet=wavelet)[1]
     else:
         raise ValueError(f"Unknown replacement_mode: {replacement_mode}")
 
@@ -798,7 +970,7 @@ def _purify_adv_tensor_global(
                 .unsqueeze(0)
                 .clamp(0.0, 1.0)
             )
-        else:
+        elif replacement_mode == "adaptive_ms":
             x_k, adaptive_meta_k = adaptive_multiscale_fusion(
                 x_orig_chw=x_adv[0],
                 x_pred_chw=x_hat_k[0],
@@ -808,6 +980,26 @@ def _purify_adv_tensor_global(
                 w_min=ms_w_min,
                 w_max=ms_w_max,
                 ll_alpha=ms_ll_alpha,
+                eps=ms_eps,
+                target_hw=target_hw,
+            )
+            ll_anchor_k = adaptive_meta_k["ll_final"]
+            hf_k_selected = dwt2_rgb_tensor(x_k, wavelet=wavelet)[1]
+            current = x_k.to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
+        else:
+            x_k, adaptive_meta_k = adaptive_multiscale_guided_fusion(
+                x_orig_chw=x_adv[0],
+                x_pred_chw=x_hat_k[0],
+                wavelet=wavelet,
+                levels=ms_levels,
+                gamma_text=ms_gamma_levels,
+                w_min=ms_w_min,
+                w_max=ms_w_max,
+                ll_gate_tau=ms_ll_gate_tau,
+                ll_gate_gain=ms_ll_gate_gain,
+                hf_pred_levels=ms_hf_pred_levels,
+                hf_gate_tau=ms_hf_gate_tau,
+                hf_gate_gain=ms_hf_gate_gain,
                 eps=ms_eps,
                 target_hw=target_hw,
             )
@@ -873,6 +1065,11 @@ def purify_adv_tensor(
     ms_w_max: float = 0.95,
     ms_ll_alpha: float = 0.08,
     ms_eps: float = 1e-6,
+    ms_ll_gate_tau: float = 0.75,
+    ms_ll_gate_gain: float = 4.0,
+    ms_hf_pred_levels: str = "0.20,0.12,0.08",
+    ms_hf_gate_tau: float = 0.5,
+    ms_hf_gate_gain: float = 4.0,
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     """
     Purify one adversarial tensor with WGCP.
@@ -899,6 +1096,11 @@ def purify_adv_tensor(
             ms_w_max=ms_w_max,
             ms_ll_alpha=ms_ll_alpha,
             ms_eps=ms_eps,
+            ms_ll_gate_tau=ms_ll_gate_tau,
+            ms_ll_gate_gain=ms_ll_gate_gain,
+            ms_hf_pred_levels=ms_hf_pred_levels,
+            ms_hf_gate_tau=ms_hf_gate_tau,
+            ms_hf_gate_gain=ms_hf_gate_gain,
         )
 
     if x_adv.ndim != 4 or x_adv.shape[0] != 1:
@@ -929,6 +1131,11 @@ def purify_adv_tensor(
         ms_w_max=ms_w_max,
         ms_ll_alpha=ms_ll_alpha,
         ms_eps=ms_eps,
+        ms_ll_gate_tau=ms_ll_gate_tau,
+        ms_ll_gate_gain=ms_ll_gate_gain,
+        ms_hf_pred_levels=ms_hf_pred_levels,
+        ms_hf_gate_tau=ms_hf_gate_tau,
+        ms_hf_gate_gain=ms_hf_gate_gain,
     )
 
     alpha_t = float(alpha_bars[t_star].item())
@@ -981,6 +1188,23 @@ def purify_adv_tensor(
                     w_min=ms_w_min,
                     w_max=ms_w_max,
                     ll_alpha=ms_ll_alpha,
+                    eps=ms_eps,
+                    target_hw=(patch_size, patch_size),
+                )
+            elif replacement_mode == "adaptive_ms_guided":
+                rec_p, _ = adaptive_multiscale_guided_fusion(
+                    x_orig_chw=batch_adv[idx],
+                    x_pred_chw=batch_hat[idx],
+                    wavelet=wavelet,
+                    levels=ms_levels,
+                    gamma_text=ms_gamma_levels,
+                    w_min=ms_w_min,
+                    w_max=ms_w_max,
+                    ll_gate_tau=ms_ll_gate_tau,
+                    ll_gate_gain=ms_ll_gate_gain,
+                    hf_pred_levels=ms_hf_pred_levels,
+                    hf_gate_tau=ms_hf_gate_tau,
+                    hf_gate_gain=ms_hf_gate_gain,
                     eps=ms_eps,
                     target_hw=(patch_size, patch_size),
                 )
@@ -1039,7 +1263,7 @@ def purify_adv_tensor(
                 .unsqueeze(0)
                 .clamp(0.0, 1.0)
             )
-        else:
+        elif replacement_mode == "adaptive_ms":
             x_k, _ = adaptive_multiscale_fusion(
                 x_orig_chw=x_adv[0],
                 x_pred_chw=x_hat_k[0],
@@ -1049,6 +1273,25 @@ def purify_adv_tensor(
                 w_min=ms_w_min,
                 w_max=ms_w_max,
                 ll_alpha=ms_ll_alpha,
+                eps=ms_eps,
+                target_hw=target_hw,
+            )
+            hf_k_selected = dwt2_rgb_tensor(x_k, wavelet=wavelet)[1]
+            current = x_k.to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
+        else:
+            x_k, _ = adaptive_multiscale_guided_fusion(
+                x_orig_chw=x_adv[0],
+                x_pred_chw=x_hat_k[0],
+                wavelet=wavelet,
+                levels=ms_levels,
+                gamma_text=ms_gamma_levels,
+                w_min=ms_w_min,
+                w_max=ms_w_max,
+                ll_gate_tau=ms_ll_gate_tau,
+                ll_gate_gain=ms_ll_gate_gain,
+                hf_pred_levels=ms_hf_pred_levels,
+                hf_gate_tau=ms_hf_gate_tau,
+                hf_gate_gain=ms_hf_gate_gain,
                 eps=ms_eps,
                 target_hw=target_hw,
             )
@@ -1147,6 +1390,11 @@ def process_one_image(
         ms_w_max=args.ms_w_max,
         ms_ll_alpha=args.ms_ll_alpha,
         ms_eps=args.ms_eps,
+        ms_ll_gate_tau=args.ms_ll_gate_tau,
+        ms_ll_gate_gain=args.ms_ll_gate_gain,
+        ms_hf_pred_levels=args.ms_hf_pred_levels,
+        ms_hf_gate_tau=args.ms_hf_gate_tau,
+        ms_hf_gate_gain=args.ms_hf_gate_gain,
     )
 
     ll_orig = trace["ll_orig"]
@@ -1231,6 +1479,11 @@ def process_one_image(
         "ms_w_max": args.ms_w_max,
         "ms_ll_alpha": args.ms_ll_alpha,
         "ms_eps": args.ms_eps,
+        "ms_ll_gate_tau": args.ms_ll_gate_tau,
+        "ms_ll_gate_gain": args.ms_ll_gate_gain,
+        "ms_hf_pred_levels": args.ms_hf_pred_levels,
+        "ms_hf_gate_tau": args.ms_hf_gate_tau,
+        "ms_hf_gate_gain": args.ms_hf_gate_gain,
         "replacement_mode": args.replacement_mode,
         "ablation_ll_source": args.ablation_ll_source,
         "ablation_hard_hf_source": args.ablation_hard_hf_source,

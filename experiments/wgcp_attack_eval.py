@@ -177,8 +177,8 @@ def parse_args() -> argparse.Namespace:
         "--replacement_mode",
         type=str,
         default="adaptive_ms",
-        choices=["hard", "fused", "adaptive_ms"],
-        help="HF replacement strategy: hard / fused / adaptive multi-scale soft-shrinkage",
+        choices=["hard", "fused", "adaptive_ms", "adaptive_ms_guided"],
+        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -201,8 +201,18 @@ def parse_args() -> argparse.Namespace:
         default="1.6,1.2,0.9",
         help="Gamma schedule for adaptive_ms soft-shrinkage by level1->L (comma separated).",
     )
-    parser.add_argument("--ms_w_min", type=float, default=0.05, help="Legacy no-op for adaptive_ms (kept for CLI compatibility).")
-    parser.add_argument("--ms_w_max", type=float, default=0.95, help="Legacy no-op for adaptive_ms (kept for CLI compatibility).")
+    parser.add_argument(
+        "--ms_w_min",
+        type=float,
+        default=0.05,
+        help="Minimum predictor weight used by guided adaptive multi-scale LL fusion.",
+    )
+    parser.add_argument(
+        "--ms_w_max",
+        type=float,
+        default=0.95,
+        help="Maximum predictor weight used by guided adaptive multi-scale LL fusion.",
+    )
     parser.add_argument(
         "--ms_ll_alpha",
         type=float,
@@ -210,6 +220,36 @@ def parse_args() -> argparse.Namespace:
         help="Deep LL blend alpha in adaptive_ms: LL=(1-a)*LL_pred + a*LL_orig.",
     )
     parser.add_argument("--ms_eps", type=float, default=1e-6, help="Numerical epsilon used in MAD estimation for adaptive_ms.")
+    parser.add_argument(
+        "--ms_ll_gate_tau",
+        type=float,
+        default=0.75,
+        help="Guided mode LL gate center; larger values make predictor LL injection more conservative.",
+    )
+    parser.add_argument(
+        "--ms_ll_gate_gain",
+        type=float,
+        default=4.0,
+        help="Guided mode LL gate sharpness; larger values make LL switching more selective.",
+    )
+    parser.add_argument(
+        "--ms_hf_pred_levels",
+        type=str,
+        default="0.20,0.12,0.08",
+        help="Guided mode predictor HF residual mix schedule by level1->L (comma separated).",
+    )
+    parser.add_argument(
+        "--ms_hf_gate_tau",
+        type=float,
+        default=0.5,
+        help="Guided mode HF gate center for predictor residual reinjection.",
+    )
+    parser.add_argument(
+        "--ms_hf_gate_gain",
+        type=float,
+        default=4.0,
+        help="Guided mode HF gate sharpness for predictor residual reinjection.",
+    )
     parser.add_argument("--patch_mode", action="store_true", help="Enable Patch-WGCP purification pipeline.")
     parser.add_argument("--patch_size", type=int, default=64, help="Patch size for Patch-WGCP.")
     parser.add_argument("--patch_stride", type=int, default=32, help="Patch stride for Patch-WGCP.")
@@ -643,6 +683,11 @@ def main() -> None:
             ms_w_max=args.ms_w_max,
             ms_ll_alpha=args.ms_ll_alpha,
             ms_eps=args.ms_eps,
+            ms_ll_gate_tau=args.ms_ll_gate_tau,
+            ms_ll_gate_gain=args.ms_ll_gate_gain,
+            ms_hf_pred_levels=args.ms_hf_pred_levels,
+            ms_hf_gate_tau=args.ms_hf_gate_tau,
+            ms_hf_gate_gain=args.ms_hf_gate_gain,
         )
         if save_detail:
             save_purify_trace(sample_dir, args.t_star, trace, x_corrected, x_final)
@@ -708,6 +753,11 @@ def main() -> None:
                 "ms_w_max": args.ms_w_max,
                 "ms_ll_alpha": args.ms_ll_alpha,
                 "ms_eps": args.ms_eps,
+                "ms_ll_gate_tau": args.ms_ll_gate_tau,
+                "ms_ll_gate_gain": args.ms_ll_gate_gain,
+                "ms_hf_pred_levels": args.ms_hf_pred_levels,
+                "ms_hf_gate_tau": args.ms_hf_gate_tau,
+                "ms_hf_gate_gain": args.ms_hf_gate_gain,
                 "replacement_mode": args.replacement_mode,
                 "ablation_ll_source": args.ablation_ll_source,
                 "ablation_hard_hf_source": args.ablation_hard_hf_source,
