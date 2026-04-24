@@ -18,32 +18,36 @@ from PIL import Image
 from tqdm import tqdm
 
 try:
-    from wgcp_small_scale import (
+    from wgcp_predictor import (
         build_predictor,
         build_alpha_bars,
+        run_predictor,
+    )
+    from wgcp_purify import purify_adv_tensor
+    from wgcp_utils import (
         coeff_to_vis,
         compute_metrics,
         ensure_dir,
         list_images,
         make_triplet_panel,
         pil_to_tensor,
-        purify_adv_tensor,
-        run_predictor,
         save_tensor_image,
         set_seed,
     )
 except ImportError:
-    from experiments.wgcp_small_scale import (
+    from experiments.wgcp_predictor import (
         build_predictor,
         build_alpha_bars,
+        run_predictor,
+    )
+    from experiments.wgcp_purify import purify_adv_tensor
+    from experiments.wgcp_utils import (
         coeff_to_vis,
         compute_metrics,
         ensure_dir,
         list_images,
         make_triplet_panel,
         pil_to_tensor,
-        purify_adv_tensor,
-        run_predictor,
         save_tensor_image,
         set_seed,
     )
@@ -177,8 +181,16 @@ def parse_args() -> argparse.Namespace:
         "--replacement_mode",
         type=str,
         default="adaptive_ms",
-        choices=["hard", "fused", "adaptive_ms", "adaptive_ms_guided"],
-        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale",
+        choices=[
+            "hard",
+            "fused",
+            "adaptive_ms",
+            "adaptive_ms_guided",
+            "adaptive_ms_edge",
+            "adaptive_ms_modmax",
+            "adaptive_ms_prior",
+        ],
+        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale / predictor-guided shrinkage",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -249,6 +261,48 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=4.0,
         help="Guided mode HF gate sharpness for predictor residual reinjection.",
+    )
+    parser.add_argument(
+        "--ms_edge_eta_levels",
+        type=str,
+        default="0.5,0.5,0.5",
+        help="Edge-aware mode threshold reduction for HL/LH by level1->L (comma separated).",
+    )
+    parser.add_argument(
+        "--ms_edge_eta_hh_levels",
+        type=str,
+        default="0.3,0.3,0.3",
+        help="Edge-aware mode threshold reduction for HH by level1->L (comma separated).",
+    )
+    parser.add_argument(
+        "--ms_edge_sigma_divisor",
+        type=float,
+        default=30.0,
+        help="Spatial divisor for local edge-energy Gaussian sigma: sigma ~= min(H,W)/divisor.",
+    )
+    parser.add_argument(
+        "--ms_edge_alpha_min",
+        type=float,
+        default=0.1,
+        help="Minimum local alpha used in edge-aware shrinkage.",
+    )
+    parser.add_argument(
+        "--ms_edge_channel_agg",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Aggregate RGB channel energy when building wavelet edge maps.",
+    )
+    parser.add_argument(
+        "--ms_modmax_threshold",
+        type=float,
+        default=0.15,
+        help="Minimum normalized modulus response kept as edge maxima in adaptive_ms_modmax.",
+    )
+    parser.add_argument(
+        "--ms_modmax_boost_levels",
+        type=str,
+        default="0.10,0.08,0.05",
+        help="Boost schedule for HL/LH modulus-maxima coefficients by level1->L (comma separated).",
     )
     parser.add_argument("--patch_mode", action="store_true", help="Enable Patch-WGCP purification pipeline.")
     parser.add_argument("--patch_size", type=int, default=64, help="Patch size for Patch-WGCP.")
@@ -447,6 +501,34 @@ def classify(
     probs = torch.softmax(logits, dim=1)
     conf, pred = probs.max(dim=1)
     return pred, conf
+
+
+def grayscale_chw(x: Tensor) -> Tensor:
+    if x.ndim != 3:
+        raise ValueError("grayscale_chw expects x with shape [C, H, W]")
+    if x.shape[0] == 1:
+        return x
+    weights = torch.tensor([0.299, 0.587, 0.114], device=x.device, dtype=x.dtype).view(3, 1, 1)
+    return (x[:3] * weights).sum(dim=0, keepdim=True)
+
+
+def compute_edge_stats(x_chw: Tensor) -> Dict[str, float]:
+    gray = grayscale_chw(x_chw.detach().clamp(0.0, 1.0))
+    dx = gray[:, :, 1:] - gray[:, :, :-1]
+    dy = gray[:, 1:, :] - gray[:, :-1, :]
+    grad_mag = torch.sqrt(
+        dx[:, :-1, :].pow(2) + dy[:, :, :-1].pow(2) + 1e-12
+    )
+    lap_kernel = torch.tensor(
+        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+        device=gray.device,
+        dtype=gray.dtype,
+    ).view(1, 1, 3, 3)
+    lap = F.conv2d(gray.unsqueeze(0), lap_kernel, padding=1).squeeze(0)
+    return {
+        "mean_gradient": float(grad_mag.mean().item()),
+        "laplacian_variance": float(lap.var(unbiased=False).item()),
+    }
 
 
 def fgsm_attack(
@@ -688,6 +770,13 @@ def main() -> None:
             ms_hf_pred_levels=args.ms_hf_pred_levels,
             ms_hf_gate_tau=args.ms_hf_gate_tau,
             ms_hf_gate_gain=args.ms_hf_gate_gain,
+            ms_edge_eta_levels=args.ms_edge_eta_levels,
+            ms_edge_eta_hh_levels=args.ms_edge_eta_hh_levels,
+            ms_edge_sigma_divisor=args.ms_edge_sigma_divisor,
+            ms_edge_alpha_min=args.ms_edge_alpha_min,
+            ms_edge_channel_agg=args.ms_edge_channel_agg,
+            ms_modmax_threshold=args.ms_modmax_threshold,
+            ms_modmax_boost_levels=args.ms_modmax_boost_levels,
         )
         if save_detail:
             save_purify_trace(sample_dir, args.t_star, trace, x_corrected, x_final)
@@ -713,6 +802,9 @@ def main() -> None:
 
         metrics_clean_adv = compute_metrics(x_clean[0], x_adv[0])
         metrics_clean_purified = compute_metrics(x_clean[0], x_final[0])
+        edge_stats_clean = compute_edge_stats(x_clean[0])
+        edge_stats_adv = compute_edge_stats(x_adv[0])
+        edge_stats_purified = compute_edge_stats(x_final[0])
 
         attack_success = int(pred_adv.item() != pred_clean.item())
         recover_success = int(pred_final.item() == pred_clean.item())
@@ -758,6 +850,13 @@ def main() -> None:
                 "ms_hf_pred_levels": args.ms_hf_pred_levels,
                 "ms_hf_gate_tau": args.ms_hf_gate_tau,
                 "ms_hf_gate_gain": args.ms_hf_gate_gain,
+                "ms_edge_eta_levels": args.ms_edge_eta_levels,
+                "ms_edge_eta_hh_levels": args.ms_edge_eta_hh_levels,
+                "ms_edge_sigma_divisor": args.ms_edge_sigma_divisor,
+                "ms_edge_alpha_min": args.ms_edge_alpha_min,
+                "ms_edge_channel_agg": bool(args.ms_edge_channel_agg),
+                "ms_modmax_threshold": args.ms_modmax_threshold,
+                "ms_modmax_boost_levels": args.ms_modmax_boost_levels,
                 "replacement_mode": args.replacement_mode,
                 "ablation_ll_source": args.ablation_ll_source,
                 "ablation_hard_hf_source": args.ablation_hard_hf_source,
@@ -777,6 +876,11 @@ def main() -> None:
             "image_metrics": {
                 "clean_vs_adv": metrics_clean_adv,
                 "clean_vs_purified": metrics_clean_purified,
+                "edge_stats": {
+                    "clean": edge_stats_clean,
+                    "adv": edge_stats_adv,
+                    "purified": edge_stats_purified,
+                },
             },
         }
 
@@ -794,6 +898,18 @@ def main() -> None:
         if item["pseudo_label_eval"]["attack_success"]
     )
     overall_consistent = sum(int(item["pseudo_label_eval"]["recover_to_clean_pred"]) for item in valid_samples)
+    mean_grad_purified = sum(
+        float(item["image_metrics"]["edge_stats"]["purified"]["mean_gradient"]) for item in valid_samples
+    ) / max(1, len(valid_samples))
+    mean_grad_adv = sum(
+        float(item["image_metrics"]["edge_stats"]["adv"]["mean_gradient"]) for item in valid_samples
+    ) / max(1, len(valid_samples))
+    lap_var_purified = sum(
+        float(item["image_metrics"]["edge_stats"]["purified"]["laplacian_variance"]) for item in valid_samples
+    ) / max(1, len(valid_samples))
+    lap_var_adv = sum(
+        float(item["image_metrics"]["edge_stats"]["adv"]["laplacian_variance"]) for item in valid_samples
+    ) / max(1, len(valid_samples))
 
     aggregate = {
         "num_samples": len(per_sample),
@@ -810,6 +926,10 @@ def main() -> None:
         "save_reference_every": int(args.save_reference_every),
         "saved_reference_images": int(saved_reference_count),
         "reference_dir": str(reference_dir) if reference_dir is not None else None,
+        "mean_gradient_adv": mean_grad_adv,
+        "mean_gradient_purified": mean_grad_purified,
+        "laplacian_variance_adv": lap_var_adv,
+        "laplacian_variance_purified": lap_var_purified,
         "note": "This script uses clean-image predicted label as pseudo-label (no ground-truth required). Low-confidence clean samples can be skipped.",
     }
 
