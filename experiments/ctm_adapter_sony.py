@@ -147,16 +147,10 @@ class CTMRepoPredictor:
                 )
 
         self.model.to(self.device)
+        # Keep model params in fp32 and rely on autocast for fp16 execution.
+        # This avoids mixed-parameter dtype pitfalls in CTM branches.
         self.use_fp16 = bool(getattr(self.args, "use_fp16", False) and self.device.type == "cuda")
-        if self.use_fp16:
-            if hasattr(self.model, "convert_to_fp16"):
-                self.model.convert_to_fp16()
-            else:
-                self.model.half()
-            # Some CTM branches keep the output head in fp32 after convert_to_fp16(),
-            # which can cause conv bias dtype mismatch at inference. Force a uniform dtype.
-            self.model.to(dtype=torch.float16)
-        self.compute_dtype = torch.float16 if self.use_fp16 else torch.float32
+        self.compute_dtype = torch.float32
         self.model.eval()
 
     def set_class_label(self, class_label: int) -> None:
@@ -190,15 +184,20 @@ class CTMRepoPredictor:
             y = torch.full((bsz,), int(self.class_label), device=self.device, dtype=torch.long)
             model_kwargs["y"] = y
 
-        denoised, g_theta = self.diffusion.get_denoised_and_G(
-            self.model,
-            x_ctm,
-            t=t,
-            s=s,
-            ctm=True,
-            teacher=False,
-            **model_kwargs,
-        )
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=self.use_fp16 and self.device.type == "cuda",
+        ):
+            denoised, g_theta = self.diffusion.get_denoised_and_G(
+                self.model,
+                x_ctm,
+                t=t,
+                s=s,
+                ctm=True,
+                teacher=False,
+                **model_kwargs,
+            )
 
         # For CTM transition t->s, G_theta corresponds to the destination state.
         x0 = g_theta

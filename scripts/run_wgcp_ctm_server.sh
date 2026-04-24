@@ -23,6 +23,7 @@ PREDICTOR_IMAGE_SIZE="$(python -c "import json;print(json.load(open(r'$CONFIG_PA
 
 CLASS_COND="${CTM_CLASS_COND:-1}"
 CLASS_LABEL="${CTM_CLASS_LABEL:-0}"
+CTM_USE_FP16="${CTM_USE_FP16:-1}"
 TORCH_CACHE="${TORCH_CACHE_DIR:-$ROOT_DIR/.cache/torch}"
 GLOB_PATTERN="${GLOB_PATTERN:-*.JPEG}"
 MAX_IMAGES="${MAX_IMAGES:-100}"
@@ -44,7 +45,7 @@ MS_GAMMA_LEVELS="${MS_GAMMA_LEVELS:-1.6,1.2,0.9}"
 MS_LL_ALPHA="${MS_LL_ALPHA:-0.08}"
 MS_EPS="${MS_EPS:-1e-6}"
 
-PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE')}))")"
+PREDICTOR_KWARGS="$(python -c "import json;print(json.dumps({'ctm_repo':r'$CTM_REPO','checkpoint':r'$CTM_CKPT','class_cond':bool(int(r'$CLASS_COND')),'class_label':int(r'$CLASS_LABEL'),'predictor_image_size':int(r'$PREDICTOR_IMAGE_SIZE'),'use_fp16':bool(int(r'$CTM_USE_FP16'))}))")"
 
 echo "Running WGCP+CTM eval"
 echo "  env: $CAMP_ENV"
@@ -58,6 +59,7 @@ echo "  reference_dir: ${REFERENCE_DIR:-<default>}"
 echo "  patch_mode: $PATCH_MODE"
 echo "  wavelet: $WAVELET"
 echo "  replacement_mode: $REPLACEMENT_MODE"
+echo "  ctm_use_fp16: $CTM_USE_FP16"
 echo "  ctm repo: $CTM_REPO"
 echo "  ckpt: $CTM_CKPT"
 
