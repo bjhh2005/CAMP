@@ -62,6 +62,34 @@ def save_tensor_image(tensor: Tensor, path: Path) -> None:
     tensor_to_pil(tensor).save(path)
 
 
+def normalize_spatial_map(x: Tensor, eps: float = 1e-6) -> Tensor:
+    if x.ndim == 2:
+        x = x.unsqueeze(0)
+    if x.ndim != 3:
+        raise ValueError("normalize_spatial_map expects [H,W] or [1,H,W] or [C,H,W]")
+    if x.shape[0] > 1:
+        x = x.mean(dim=0, keepdim=True)
+    x = x.detach().float()
+    x = x - x.min()
+    denom = x.max().clamp_min(eps)
+    return (x / denom).clamp(0.0, 1.0)
+
+
+def spatial_map_to_rgb(x: Tensor) -> Tensor:
+    heat = normalize_spatial_map(x)
+    red = heat
+    green = (1.0 - (2.0 * heat - 1.0).abs()).clamp(0.0, 1.0)
+    blue = 1.0 - heat
+    return torch.cat([red, green, blue], dim=0).clamp(0.0, 1.0)
+
+
+def blend_heatmap_on_image(image_chw: Tensor, heatmap: Tensor, alpha: float = 0.45) -> Tensor:
+    base = image_chw.detach().float().clamp(0.0, 1.0)
+    heat_rgb = spatial_map_to_rgb(heatmap)
+    mix = float(np.clip(alpha, 0.0, 1.0))
+    return ((1.0 - mix) * base + mix * heat_rgb).clamp(0.0, 1.0)
+
+
 def coeff_to_vis(coeff: Tensor) -> Tensor:
     max_abs = torch.max(torch.abs(coeff))
     if max_abs < 1e-8:

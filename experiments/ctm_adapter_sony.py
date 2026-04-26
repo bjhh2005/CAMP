@@ -16,7 +16,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -156,6 +156,45 @@ class CTMRepoPredictor:
     def set_class_label(self, class_label: int) -> None:
         self.class_label = int(class_label)
 
+    def list_named_modules(self, leaf_only: bool = True) -> List[str]:
+        names: List[str] = []
+        for name, module in self.model.named_modules():
+            if not name:
+                continue
+            if leaf_only and any(True for _ in module.children()):
+                continue
+            names.append(name)
+        return names
+
+    def _resolve_named_module(self, layer: str) -> Tuple[str, torch.nn.Module]:
+        layer_text = str(layer).strip()
+        if not layer_text:
+            raise ValueError("layer must be a non-empty string")
+
+        named_modules = [(name, module) for name, module in self.model.named_modules() if name]
+        exact = [(name, module) for name, module in named_modules if name == layer_text]
+        if len(exact) == 1:
+            return exact[0]
+
+        if layer_text.isdigit():
+            idx = int(layer_text)
+            leaf_names = self.list_named_modules(leaf_only=True)
+            if idx < 0 or idx >= len(leaf_names):
+                raise IndexError(f"layer index out of range: {idx} not in [0, {len(leaf_names) - 1}]")
+            target_name = leaf_names[idx]
+            for name, module in named_modules:
+                if name == target_name:
+                    return name, module
+
+        partial = [(name, module) for name, module in named_modules if layer_text in name]
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            names = ", ".join(name for name, _ in partial[:8])
+            raise ValueError(f"layer '{layer_text}' matched multiple modules: {names}")
+
+        raise KeyError(f"layer '{layer_text}' not found in CTM model modules")
+
     def _index_to_sigma(self, t_index: int) -> float:
         if self.num_diffusion_steps <= 1:
             return self.sigma_min
@@ -165,8 +204,7 @@ class CTMRepoPredictor:
         )
         return float(sigma**self.rho)
 
-    @torch.no_grad()
-    def __call__(self, x_t: torch.Tensor, t_index: int) -> torch.Tensor:
+    def _build_model_inputs(self, x_t: torch.Tensor, t_index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if x_t.ndim != 4:
             raise ValueError("x_t must be [B,C,H,W]")
         x_t = x_t.to(device=self.device, dtype=self.compute_dtype)
@@ -183,7 +221,11 @@ class CTMRepoPredictor:
         if self.class_cond:
             y = torch.full((bsz,), int(self.class_label), device=self.device, dtype=torch.long)
             model_kwargs["y"] = y
+        return x_t, x_ctm, t, model_kwargs
 
+    def _run_diffusion(self, x_t: torch.Tensor, t_index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        _, x_ctm, t, model_kwargs = self._build_model_inputs(x_t, t_index)
+        s = torch.full((x_ctm.shape[0],), self.sigma_min, device=self.device, dtype=x_ctm.dtype)
         with torch.autocast(
             device_type="cuda",
             dtype=torch.float16,
@@ -198,8 +240,106 @@ class CTMRepoPredictor:
                 teacher=False,
                 **model_kwargs,
             )
+        return denoised, g_theta
 
-        # For CTM transition t->s, G_theta corresponds to the destination state.
-        x0 = g_theta
-        x0 = (x0 + 1.0) / 2.0
+    def _to_output_image(self, g_theta: torch.Tensor) -> torch.Tensor:
+        x0 = (g_theta + 1.0) / 2.0
         return x0.float().clamp(0.0, 1.0)
+
+    def _extract_first_tensor(self, obj: Any) -> Optional[torch.Tensor]:
+        if torch.is_tensor(obj):
+            return obj
+        if isinstance(obj, (list, tuple)):
+            for item in obj:
+                tensor = self._extract_first_tensor(item)
+                if tensor is not None:
+                    return tensor
+            return None
+        if isinstance(obj, dict):
+            for item in obj.values():
+                tensor = self._extract_first_tensor(item)
+                if tensor is not None:
+                    return tensor
+        return None
+
+    def _collect_spatial_features(
+        self,
+        x_t: torch.Tensor,
+        t_index: int,
+        leaf_only: bool = True,
+    ) -> List[Tuple[str, torch.Tensor]]:
+        captures: List[Tuple[str, torch.Tensor]] = []
+        hooks = []
+        try:
+            for name, module in self.model.named_modules():
+                if not name:
+                    continue
+                if leaf_only and any(True for _ in module.children()):
+                    continue
+
+                def _make_hook(module_name: str):
+                    def _hook(_module: torch.nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
+                        tensor = self._extract_first_tensor(output)
+                        if tensor is None or tensor.ndim != 4:
+                            return
+                        captures.append((module_name, tensor.detach()))
+
+                    return _hook
+
+                hooks.append(module.register_forward_hook(_make_hook(name)))
+            self._run_diffusion(x_t, t_index)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        return captures
+
+    def extract_feature_map(
+        self,
+        x_t: torch.Tensor,
+        t_index: int,
+        layer: str = "",
+        leaf_only: bool = True,
+    ) -> Dict[str, Any]:
+        feature_capture: Dict[str, torch.Tensor] = {}
+
+        if layer.strip():
+            module_name, module = self._resolve_named_module(layer)
+
+            def _hook(_module: torch.nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
+                tensor = self._extract_first_tensor(output)
+                if tensor is None:
+                    raise RuntimeError(f"Module '{module_name}' did not emit a tensor output")
+                feature_capture["feature"] = tensor.detach()
+
+            hook = module.register_forward_hook(_hook)
+            try:
+                _denoised, g_theta = self._run_diffusion(x_t, t_index)
+            finally:
+                hook.remove()
+            feature = feature_capture.get("feature")
+            if feature is None:
+                raise RuntimeError(f"Failed to capture feature map from module '{module_name}'")
+            if feature.ndim != 4:
+                raise ValueError(f"Captured feature from '{module_name}' is not 4D: shape={tuple(feature.shape)}")
+            return {
+                "layer": module_name,
+                "feature": feature.float(),
+                "x0_hat": self._to_output_image(g_theta),
+            }
+
+        captures = self._collect_spatial_features(x_t=x_t, t_index=t_index, leaf_only=leaf_only)
+        if not captures:
+            raise RuntimeError("Could not auto-select a spatial 4D feature map from the CTM model")
+        module_name, feature = captures[-1]
+        _, g_theta = self._run_diffusion(x_t, t_index)
+        return {
+            "layer": module_name,
+            "feature": feature.float(),
+            "x0_hat": self._to_output_image(g_theta),
+        }
+
+    @torch.no_grad()
+    def __call__(self, x_t: torch.Tensor, t_index: int) -> torch.Tensor:
+        _denoised, g_theta = self._run_diffusion(x_t, t_index)
+        # For CTM transition t->s, G_theta corresponds to the destination state.
+        return self._to_output_image(g_theta)

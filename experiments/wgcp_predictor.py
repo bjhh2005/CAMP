@@ -2,6 +2,7 @@ import argparse
 import importlib
 import json
 import math
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -82,7 +83,7 @@ def run_predictor(
     x_t: Tensor,
     t_index: int,
     predictor_image_size: int,
-) -> Tensor:
+    ) -> Tensor:
     if predictor_image_size and predictor_image_size > 0:
         height, width = x_t.shape[-2:]
         x_small = F.interpolate(
@@ -95,3 +96,44 @@ def run_predictor(
         x0_hat = F.interpolate(x0_small, size=(height, width), mode="bilinear", align_corners=False)
         return x0_hat.clamp(0.0, 1.0)
     return predictor(x_t, t_index).clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def run_predictor_with_features(
+    predictor,
+    x_t: Tensor,
+    t_index: int,
+    predictor_image_size: int,
+    feature_layer: str = "",
+    feature_leaf_only: bool = True,
+) -> Dict[str, Any]:
+    if not hasattr(predictor, "extract_feature_map"):
+        raise AttributeError("Predictor does not expose extract_feature_map(...) required for E2 feature probing")
+
+    height, width = x_t.shape[-2:]
+    x_small = x_t
+    if predictor_image_size and predictor_image_size > 0:
+        x_small = F.interpolate(
+            x_t,
+            size=(predictor_image_size, predictor_image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    feature_info = predictor.extract_feature_map(x_small, t_index, layer=feature_layer, leaf_only=feature_leaf_only)
+    x0_small = feature_info["x0_hat"]
+    feature_small = feature_info["feature"]
+
+    x0_hat = x0_small
+    feature = feature_small
+    if predictor_image_size and predictor_image_size > 0:
+        x0_hat = F.interpolate(x0_small, size=(height, width), mode="bilinear", align_corners=False)
+        feature = F.interpolate(feature_small, size=(height, width), mode="bilinear", align_corners=False)
+
+    return {
+        "x0_hat": x0_hat.clamp(0.0, 1.0),
+        "feature": feature.float(),
+        "feature_small": feature_small.float(),
+        "layer": feature_info["layer"],
+        "input_small": x_small.detach().clone(),
+    }
