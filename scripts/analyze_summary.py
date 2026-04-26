@@ -65,6 +65,8 @@ def load_summary(summary_path: Path) -> Dict[str, object]:
 def detect_summary_kind(summary_obj: Dict[str, object]) -> str:
     if "aggregate" in summary_obj:
         return "attack_eval"
+    if "resolved_feature_layer" in summary_obj or safe_get(summary_obj, ["samples", 0, "feature_probe"]) is not None:
+        return "feature_probe"
     return "small_scale"
 
 
@@ -183,6 +185,101 @@ def flatten_small_scale_sample(sample: Dict[str, object], label: str) -> Dict[st
     return row
 
 
+def flatten_feature_probe_sample(sample: Dict[str, object], label: str) -> Dict[str, object]:
+    preds = sample.get("predictions", {}) if isinstance(sample.get("predictions"), dict) else {}
+    feature_probe = sample.get("feature_probe", {}) if isinstance(sample.get("feature_probe"), dict) else {}
+    clean_pred = safe_get(preds, ["clean", "pred"])
+    adv_pred = safe_get(preds, ["adv", "pred"])
+    purified_pred = safe_get(preds, ["purified", "pred"])
+
+    row: Dict[str, object] = {
+        "experiment": label,
+        "sample_index": sample.get("sample_index"),
+        "image": sample.get("image_path"),
+        "sample_dir": sample.get("output_dir"),
+        "attack_success": bool_to_int(sample.get("attack_success")),
+        "predictor_infer_ms": sample.get("predictor_infer_ms"),
+        "feature_layer": sample.get("feature_layer"),
+        "clean_pred": clean_pred,
+        "adv_pred": adv_pred,
+        "purified_pred": purified_pred,
+        "clean_conf": safe_get(preds, ["clean", "conf"]),
+        "adv_conf": safe_get(preds, ["adv", "conf"]),
+        "purified_conf": safe_get(preds, ["purified", "conf"]),
+        "recover_to_clean_pred": bool_to_int(
+            clean_pred is not None and purified_pred is not None and int(clean_pred) == int(purified_pred)
+        ),
+    }
+
+    for source_name, source_info in feature_probe.items():
+        if not isinstance(source_info, dict):
+            continue
+        stats = source_info.get("stats", {}) if isinstance(source_info.get("stats"), dict) else {}
+        row[f"{source_name}__layer"] = source_info.get("layer")
+        row[f"{source_name}__feature_shape"] = json.dumps(source_info.get("feature_shape", []), ensure_ascii=False)
+        row[f"{source_name}__input_small_shape"] = json.dumps(source_info.get("input_small_shape", []), ensure_ascii=False)
+        row[f"{source_name}__feature_mean"] = stats.get("feature_mean")
+        row[f"{source_name}__feature_max"] = stats.get("feature_max")
+        row[f"{source_name}__gradient_mean"] = stats.get("gradient_mean")
+        row[f"{source_name}__gradient_max"] = stats.get("gradient_max")
+        f_mean = float_or_none(stats.get("feature_mean"))
+        g_mean = float_or_none(stats.get("gradient_mean"))
+        row[f"{source_name}__feature_minus_gradient_mean"] = (
+            None if f_mean is None or g_mean is None else f_mean - g_mean
+        )
+
+    adv_mean = float_or_none(row.get("adv__feature_mean"))
+    hat_mean = float_or_none(row.get("hat__feature_mean"))
+    xt_mean = float_or_none(row.get("xt__feature_mean"))
+    row["hat_minus_adv_feature_mean"] = None if hat_mean is None or adv_mean is None else hat_mean - adv_mean
+    row["xt_minus_adv_feature_mean"] = None if xt_mean is None or adv_mean is None else xt_mean - adv_mean
+    return row
+
+
+def summarize_feature_probe_samples(samples: List[Dict[str, object]]) -> Dict[str, Optional[float]]:
+    rows = [flatten_feature_probe_sample(sample, label="summary") for sample in samples]
+    attack_values = [int(row["attack_success"]) for row in rows if row.get("attack_success") is not None]
+    recover_values = [int(row["recover_to_clean_pred"]) for row in rows if row.get("recover_to_clean_pred") is not None]
+
+    summary: Dict[str, Optional[float]] = {
+        "num_saved_samples": float(len(rows)),
+        "attack_success_rate": mean(attack_values) if attack_values else None,
+        "clean_pred_consistency_rate": mean(recover_values) if recover_values else None,
+        "recover_rate_on_attacked": (
+            mean(
+                [
+                    int(row["recover_to_clean_pred"])
+                    for row in rows
+                    if row.get("attack_success") == 1 and row.get("recover_to_clean_pred") is not None
+                ]
+            )
+            if any(row.get("attack_success") == 1 for row in rows)
+            else None
+        ),
+        "mean_predictor_infer_ms": mean(
+            [float(row["predictor_infer_ms"]) for row in rows if isinstance(row.get("predictor_infer_ms"), (int, float))]
+        )
+        if rows
+        else None,
+    }
+
+    feature_keys = sorted(
+        {
+            key
+            for row in rows
+            for key in row.keys()
+            if key.endswith("__feature_mean")
+            or key.endswith("__gradient_mean")
+            or key.endswith("__feature_minus_gradient_mean")
+            or key in {"hat_minus_adv_feature_mean", "xt_minus_adv_feature_mean"}
+        }
+    )
+    for key in feature_keys:
+        values = [float(row[key]) for row in rows if isinstance(row.get(key), (int, float))]
+        summary[f"mean_{key}"] = mean(values) if values else None
+    return summary
+
+
 def build_overview_row(label: str, summary_path: Path, summary_obj: Dict[str, object]) -> Dict[str, object]:
     kind = detect_summary_kind(summary_obj)
     samples = summary_obj.get("samples", [])
@@ -203,6 +300,15 @@ def build_overview_row(label: str, summary_path: Path, summary_obj: Dict[str, ob
         row["replacement_mode"] = safe_get(summary_obj, ["samples", 0, "wgcp", "replacement_mode"])
         row["classifier"] = safe_get(summary_obj, ["samples", 0, "classifier"])
         row["attack_type"] = safe_get(summary_obj, ["samples", 0, "attack", "type"])
+    elif kind == "feature_probe":
+        samples_list = samples if isinstance(samples, list) else []
+        row["replacement_mode"] = safe_get(run_meta, ["args", "replacement_mode"])
+        row["classifier"] = safe_get(run_meta, ["args", "classifier"])
+        row["attack_type"] = safe_get(run_meta, ["args", "attack"])
+        row["feature_layer"] = summary_obj.get("resolved_feature_layer")
+        row["ctm_feature_sources"] = safe_get(run_meta, ["args", "ctm_feature_sources"])
+        row["ctm_feature_reduce"] = safe_get(run_meta, ["args", "ctm_feature_reduce"])
+        row.update(summarize_feature_probe_samples(samples_list))
     else:
         samples_list = samples if isinstance(samples, list) else []
         if samples_list:
@@ -219,6 +325,8 @@ def get_indexable(summary_obj: Dict[str, object], label: str) -> List[Dict[str, 
         return []
     if kind == "attack_eval":
         return [flatten_attack_eval_sample(sample, label) for sample in samples]
+    if kind == "feature_probe":
+        return [flatten_feature_probe_sample(sample, label) for sample in samples]
     return [flatten_small_scale_sample(sample, label) for sample in samples]
 
 
@@ -289,6 +397,16 @@ def print_overview(rows: List[Dict[str, object]]) -> None:
                 f"mean_gradient_purified={round_or_blank(float_or_none(row.get('mean_gradient_purified')), 6)}, "
                 f"laplacian_variance_purified={round_or_blank(float_or_none(row.get('laplacian_variance_purified')), 6)}"
             )
+        elif kind == "feature_probe":
+            print(
+                "  "
+                f"{label}: feature_layer={row.get('feature_layer', '')}, "
+                f"recover_rate_on_attacked={round_or_blank(float_or_none(row.get('recover_rate_on_attacked')), 4)}, "
+                f"clean_pred_consistency_rate={round_or_blank(float_or_none(row.get('clean_pred_consistency_rate')), 4)}, "
+                f"mean_predictor_infer_ms={round_or_blank(float_or_none(row.get('mean_predictor_infer_ms')), 3)}, "
+                f"mean_adv__feature_mean={round_or_blank(float_or_none(row.get('mean_adv__feature_mean')), 4)}, "
+                f"mean_hat__feature_mean={round_or_blank(float_or_none(row.get('mean_hat__feature_mean')), 4)}"
+            )
         else:
             print(
                 "  "
@@ -347,6 +465,49 @@ def print_attack_eval_highlights(
             )
 
 
+def print_feature_probe_highlights(
+    named_summaries: List[Tuple[str, Path, Dict[str, object]]],
+    top_k: int,
+) -> None:
+    if not named_summaries:
+        return
+    if any(detect_summary_kind(summary_obj) != "feature_probe" for _, _, summary_obj in named_summaries):
+        return
+
+    print("\nFeature Probe Highlights")
+    for label, _, summary_obj in named_summaries:
+        rows = get_indexable(summary_obj, label)
+        strongest_hat_gain = sorted(
+            [row for row in rows if float_or_none(row.get("hat_minus_adv_feature_mean")) is not None],
+            key=lambda row: -(float_or_none(row.get("hat_minus_adv_feature_mean")) or -math.inf),
+        )[:top_k]
+        weakest_hat_gain = sorted(
+            [row for row in rows if float_or_none(row.get("hat_minus_adv_feature_mean")) is not None],
+            key=lambda row: (float_or_none(row.get("hat_minus_adv_feature_mean")) or math.inf),
+        )[:top_k]
+
+        print(f"  {label} top hat-adv feature gain samples:")
+        for row in strongest_hat_gain:
+            print(
+                "    "
+                f"{Path(str(row.get('image'))).name}: "
+                f"hat-adv={round_or_blank(float_or_none(row.get('hat_minus_adv_feature_mean')), 4)}, "
+                f"adv_f={round_or_blank(float_or_none(row.get('adv__feature_mean')), 4)}, "
+                f"hat_f={round_or_blank(float_or_none(row.get('hat__feature_mean')), 4)}, "
+                f"recover={row.get('recover_to_clean_pred')}"
+            )
+        print(f"  {label} lowest hat-adv feature gain samples:")
+        for row in weakest_hat_gain:
+            print(
+                "    "
+                f"{Path(str(row.get('image'))).name}: "
+                f"hat-adv={round_or_blank(float_or_none(row.get('hat_minus_adv_feature_mean')), 4)}, "
+                f"adv_f={round_or_blank(float_or_none(row.get('adv__feature_mean')), 4)}, "
+                f"hat_f={round_or_blank(float_or_none(row.get('hat__feature_mean')), 4)}, "
+                f"recover={row.get('recover_to_clean_pred')}"
+            )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -375,6 +536,7 @@ def main() -> None:
 
     print_overview(overview_rows)
     print_attack_eval_highlights(named_summaries, top_k=max(1, args.top_k))
+    print_feature_probe_highlights(named_summaries, top_k=max(1, args.top_k))
 
     print("\nExports")
     print(f"  overview.csv -> {args.output_dir / 'overview.csv'}")

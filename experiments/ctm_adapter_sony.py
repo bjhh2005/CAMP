@@ -293,6 +293,27 @@ class CTMRepoPredictor:
                 hook.remove()
         return captures
 
+    def _select_auto_feature_capture(
+        self,
+        captures: List[Tuple[str, torch.Tensor]],
+    ) -> Tuple[str, torch.Tensor]:
+        if not captures:
+            raise RuntimeError("Could not auto-select a spatial 4D feature map from the CTM model")
+
+        strong_candidates = [
+            (name, feat)
+            for name, feat in captures
+            if feat.ndim == 4 and int(feat.shape[1]) >= 8 and min(int(feat.shape[-2]), int(feat.shape[-1])) >= 8
+        ]
+        if strong_candidates:
+            return strong_candidates[-1]
+
+        weak_candidates = [(name, feat) for name, feat in captures if feat.ndim == 4 and int(feat.shape[1]) > 3]
+        if weak_candidates:
+            return weak_candidates[-1]
+
+        return captures[-1]
+
     def extract_feature_map(
         self,
         x_t: torch.Tensor,
@@ -328,9 +349,7 @@ class CTMRepoPredictor:
             }
 
         captures = self._collect_spatial_features(x_t=x_t, t_index=t_index, leaf_only=leaf_only)
-        if not captures:
-            raise RuntimeError("Could not auto-select a spatial 4D feature map from the CTM model")
-        module_name, feature = captures[-1]
+        module_name, feature = self._select_auto_feature_capture(captures)
         _, g_theta = self._run_diffusion(x_t, t_index)
         return {
             "layer": module_name,

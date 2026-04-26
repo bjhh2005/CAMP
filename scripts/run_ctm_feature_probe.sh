@@ -46,6 +46,8 @@ CTM_FEATURE_T_INDEX="${CTM_FEATURE_T_INDEX:--1}"
 CTM_FEATURE_OVERLAY_ALPHA="${CTM_FEATURE_OVERLAY_ALPHA:-0.45}"
 CTM_FEATURE_LEAF_ONLY="${CTM_FEATURE_LEAF_ONLY:-1}"
 LIST_FEATURE_MODULES="${LIST_FEATURE_MODULES:-0}"
+AUTO_ANALYZE="${AUTO_ANALYZE:-1}"
+ANALYSIS_OUTPUT_DIR="${ANALYSIS_OUTPUT_DIR:-$OUTPUT_DIR/analysis}"
 
 echo "Running CTM feature probe (E2)"
 echo "  env: $CAMP_ENV"
@@ -107,3 +109,13 @@ fi
 conda run -n "$CAMP_ENV" python "$ROOT_DIR/experiments/ctm_feature_probe.py" \
   "${ARGS[@]}" \
   "$@"
+
+if [ "$AUTO_ANALYZE" = "1" ] && [ "$LIST_FEATURE_MODULES" != "1" ]; then
+  echo ""
+  echo "Running post-analysis"
+  echo "  input: $OUTPUT_DIR"
+  echo "  output: $ANALYSIS_OUTPUT_DIR"
+  conda run -n "$CAMP_ENV" python "$ROOT_DIR/scripts/analyze_summary.py" \
+    --inputs "$OUTPUT_DIR" \
+    --output_dir "$ANALYSIS_OUTPUT_DIR"
+fi
