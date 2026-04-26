@@ -2,6 +2,8 @@ import argparse
 import importlib
 import json
 import math
+import sys
+from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
@@ -46,6 +48,29 @@ class GaussianCTMPredictor:
         return x0_hat.clamp(0.0, 1.0)
 
 
+def _import_predictor_module(module_name: str):
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        root_dir = Path(__file__).resolve().parents[1]
+        experiments_dir = root_dir / "experiments"
+        for path in (str(root_dir), str(experiments_dir)):
+            if path not in sys.path:
+                sys.path.insert(0, path)
+
+        if module_name.startswith("experiments."):
+            short_name = module_name.split(".", 1)[1]
+            try:
+                return importlib.import_module(short_name)
+            except ModuleNotFoundError:
+                pass
+
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            raise exc
+
+
 def build_predictor(args: argparse.Namespace, device: torch.device):
     if args.predictor_type == "gaussian":
         return GaussianCTMPredictor(kernel_size=args.kernel_size, sigma=args.sigma, mix=args.mix)
@@ -54,7 +79,7 @@ def build_predictor(args: argparse.Namespace, device: torch.device):
         if ":" not in args.predictor_module:
             raise ValueError("predictor_module must be 'package.module:ClassName'")
         module_name, class_name = args.predictor_module.split(":", 1)
-        module = importlib.import_module(module_name)
+        module = _import_predictor_module(module_name)
         cls = getattr(module, class_name)
         kwargs = json.loads(args.predictor_kwargs_json)
         kwargs.setdefault("device", str(device))
