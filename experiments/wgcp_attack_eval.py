@@ -187,11 +187,14 @@ def parse_args() -> argparse.Namespace:
             "adaptive_ms",
             "adaptive_ms_guided",
             "adaptive_ms_w2lite",
+            "wgcp_v2_cm",
+            "wgcp_v2_fuse",
+            "wgcp_v2_opt",
             "adaptive_ms_edge",
             "adaptive_ms_modmax",
             "adaptive_ms_prior",
         ],
-        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale / W2-lite predictor-HF blend / predictor-guided shrinkage",
+        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale / W2-lite / WGCP v2 CM/fuse/opt / predictor-guided shrinkage",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -268,6 +271,32 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=4.0,
         help="Guided mode HF gate sharpness for predictor residual reinjection.",
+    )
+    parser.add_argument("--wgcp_v2_steps", type=int, default=15, help="WGCP v2 optimization steps for wgcp_v2_opt.")
+    parser.add_argument("--wgcp_v2_lr", type=float, default=0.01, help="WGCP v2 optimization learning rate.")
+    parser.add_argument(
+        "--wgcp_v2_pixel_gamma",
+        type=float,
+        default=1.0,
+        help="WGCP v2 weight on pixel fidelity term ||x-x_cm||^2.",
+    )
+    parser.add_argument(
+        "--wgcp_v2_lambda_ll_levels",
+        type=str,
+        default="10.0,10.0,10.0",
+        help="WGCP v2 LL loss weights by level1->L.",
+    )
+    parser.add_argument(
+        "--wgcp_v2_lambda_h_levels",
+        type=str,
+        default="1.0,1.0,1.0",
+        help="WGCP v2 LH/HL loss weights by level1->L.",
+    )
+    parser.add_argument(
+        "--wgcp_v2_lambda_hh_levels",
+        type=str,
+        default="0.5,0.5,0.5",
+        help="WGCP v2 HH loss weights by level1->L.",
     )
     parser.add_argument(
         "--ms_edge_eta_levels",
@@ -601,6 +630,14 @@ def save_purify_trace(sample_dir: Path, t_star: int, trace: Dict[str, object], x
 
     save_tensor_image(x_t[0].clamp(0.0, 1.0), sample_dir / f"03_x_t{t_star}.png")
     save_tensor_image(x0_hat[0], sample_dir / "04_x0_hat.png")
+    wgcp_v2 = trace.get("wgcp_v2")
+    if isinstance(wgcp_v2, dict):
+        x_cm = wgcp_v2.get("x_cm")
+        x_c1 = wgcp_v2.get("x_c1")
+        if torch.is_tensor(x_cm):
+            save_tensor_image(x_cm, sample_dir / "04b_x_cm.png")
+        if torch.is_tensor(x_c1):
+            save_tensor_image(x_c1, sample_dir / "04c_x_c1_ref.png")
     save_tensor_image(ll_hat.clamp(0.0, 1.0), sample_dir / "05_LL_hat.png")
     save_tensor_image(ll_anchor.clamp(0.0, 1.0), sample_dir / "05_LL_anchor.png")
     save_tensor_image(coeff_to_vis(hf_hat["HL"]), sample_dir / "05_HL_hat_vis.png")
@@ -778,6 +815,12 @@ def main() -> None:
             ms_w2_hf_mix_levels=args.ms_w2_hf_mix_levels,
             ms_hf_gate_tau=args.ms_hf_gate_tau,
             ms_hf_gate_gain=args.ms_hf_gate_gain,
+            wgcp_v2_steps=args.wgcp_v2_steps,
+            wgcp_v2_lr=args.wgcp_v2_lr,
+            wgcp_v2_pixel_gamma=args.wgcp_v2_pixel_gamma,
+            wgcp_v2_lambda_ll_levels=args.wgcp_v2_lambda_ll_levels,
+            wgcp_v2_lambda_h_levels=args.wgcp_v2_lambda_h_levels,
+            wgcp_v2_lambda_hh_levels=args.wgcp_v2_lambda_hh_levels,
             ms_edge_eta_levels=args.ms_edge_eta_levels,
             ms_edge_eta_hh_levels=args.ms_edge_eta_hh_levels,
             ms_edge_sigma_divisor=args.ms_edge_sigma_divisor,
@@ -816,6 +859,31 @@ def main() -> None:
 
         attack_success = int(pred_adv.item() != pred_clean.item())
         recover_success = int(pred_final.item() == pred_clean.item())
+        wgcp_v2_trace = trace.get("wgcp_v2")
+        wgcp_v2_summary = None
+        if isinstance(wgcp_v2_trace, dict):
+            wgcp_v2_summary = {
+                "variant": wgcp_v2_trace.get("variant"),
+                "hf_policy": wgcp_v2_trace.get("hf_policy"),
+                "steps": wgcp_v2_trace.get("steps"),
+                "lr": wgcp_v2_trace.get("lr"),
+                "pixel_gamma": wgcp_v2_trace.get("pixel_gamma"),
+                "final_loss": (
+                    wgcp_v2_trace.get("loss_history", [{}])[-1].get("loss_total")
+                    if wgcp_v2_trace.get("loss_history")
+                    else None
+                ),
+                "final_wavelet_loss": (
+                    wgcp_v2_trace.get("loss_history", [{}])[-1].get("loss_wavelet")
+                    if wgcp_v2_trace.get("loss_history")
+                    else None
+                ),
+                "final_pixel_loss": (
+                    wgcp_v2_trace.get("loss_history", [{}])[-1].get("loss_pixel")
+                    if wgcp_v2_trace.get("loss_history")
+                    else None
+                ),
+            }
 
         record = {
             "image": str(image_path),
@@ -859,6 +927,12 @@ def main() -> None:
                 "ms_w2_hf_mix_levels": args.ms_w2_hf_mix_levels,
                 "ms_hf_gate_tau": args.ms_hf_gate_tau,
                 "ms_hf_gate_gain": args.ms_hf_gate_gain,
+                "wgcp_v2_steps": args.wgcp_v2_steps,
+                "wgcp_v2_lr": args.wgcp_v2_lr,
+                "wgcp_v2_pixel_gamma": args.wgcp_v2_pixel_gamma,
+                "wgcp_v2_lambda_ll_levels": args.wgcp_v2_lambda_ll_levels,
+                "wgcp_v2_lambda_h_levels": args.wgcp_v2_lambda_h_levels,
+                "wgcp_v2_lambda_hh_levels": args.wgcp_v2_lambda_hh_levels,
                 "ms_edge_eta_levels": args.ms_edge_eta_levels,
                 "ms_edge_eta_hh_levels": args.ms_edge_eta_hh_levels,
                 "ms_edge_sigma_divisor": args.ms_edge_sigma_divisor,
@@ -871,6 +945,7 @@ def main() -> None:
                 "ablation_hard_hf_source": args.ablation_hard_hf_source,
                 "hf_preserve": args.hf_preserve,
                 "hf_shrink": args.hf_shrink,
+                "wgcp_v2": wgcp_v2_summary,
             },
             "pseudo_label_eval": {
                 "clean_pred": int(pred_clean.item()),

@@ -81,11 +81,14 @@ def parse_args() -> argparse.Namespace:
             "adaptive_ms",
             "adaptive_ms_guided",
             "adaptive_ms_w2lite",
+            "wgcp_v2_cm",
+            "wgcp_v2_fuse",
+            "wgcp_v2_opt",
             "adaptive_ms_edge",
             "adaptive_ms_modmax",
             "adaptive_ms_prior",
         ],
-        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale / W2-lite predictor-HF blend / predictor-guided shrinkage",
+        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale / W2-lite / WGCP v2 CM/fuse/opt / predictor-guided shrinkage",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -162,6 +165,32 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=4.0,
         help="Guided mode HF gate sharpness for predictor residual reinjection.",
+    )
+    parser.add_argument("--wgcp_v2_steps", type=int, default=15, help="WGCP v2 optimization steps for wgcp_v2_opt.")
+    parser.add_argument("--wgcp_v2_lr", type=float, default=0.01, help="WGCP v2 optimization learning rate.")
+    parser.add_argument(
+        "--wgcp_v2_pixel_gamma",
+        type=float,
+        default=1.0,
+        help="WGCP v2 weight on pixel fidelity term ||x-x_cm||^2.",
+    )
+    parser.add_argument(
+        "--wgcp_v2_lambda_ll_levels",
+        type=str,
+        default="10.0,10.0,10.0",
+        help="WGCP v2 LL loss weights by level1->L.",
+    )
+    parser.add_argument(
+        "--wgcp_v2_lambda_h_levels",
+        type=str,
+        default="1.0,1.0,1.0",
+        help="WGCP v2 LH/HL loss weights by level1->L.",
+    )
+    parser.add_argument(
+        "--wgcp_v2_lambda_hh_levels",
+        type=str,
+        default="0.5,0.5,0.5",
+        help="WGCP v2 HH loss weights by level1->L.",
     )
     parser.add_argument(
         "--ms_edge_eta_levels",

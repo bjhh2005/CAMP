@@ -30,6 +30,11 @@ try:
         fuse_high_frequency,
         idwt2_rgb_tensor,
     )
+    from .wgcp_w2 import (
+        wgcp_v2_cm_output,
+        wgcp_v2_lowfreq_fusion,
+        wgcp_v2_optimize,
+    )
 except ImportError:
     from wgcp_predictor import add_noise, run_predictor
     from wgcp_utils import (
@@ -49,6 +54,11 @@ except ImportError:
         dwt2_rgb_tensor,
         fuse_high_frequency,
         idwt2_rgb_tensor,
+    )
+    from wgcp_w2 import (
+        wgcp_v2_cm_output,
+        wgcp_v2_lowfreq_fusion,
+        wgcp_v2_optimize,
     )
 
 
@@ -84,6 +94,12 @@ def _reconstruct_from_prediction(
     ms_edge_channel_agg: bool,
     ms_modmax_threshold: float,
     ms_modmax_boost_levels: str,
+    wgcp_v2_steps: int,
+    wgcp_v2_lr: float,
+    wgcp_v2_pixel_gamma: float,
+    wgcp_v2_lambda_ll_levels: str,
+    wgcp_v2_lambda_h_levels: str,
+    wgcp_v2_lambda_hh_levels: str,
     orig_components: Optional[Tuple[Tensor, Dict[str, Tensor]]] = None,
     ll_source_override: Optional[str] = None,
     forced_ll_anchor: Optional[Tensor] = None,
@@ -95,6 +111,7 @@ def _reconstruct_from_prediction(
 
     ll_hat, hf_hat = dwt2_rgb_tensor(x_pred_chw, wavelet=wavelet)
     adaptive_meta: Optional[Dict[str, object]] = None
+    wgcp_v2_meta: Optional[Dict[str, object]] = None
     ll_source = ll_source_override or ablation_ll_source
 
     if replacement_mode == "hard":
@@ -153,6 +170,51 @@ def _reconstruct_from_prediction(
         )
         ll_anchor = adaptive_meta["ll_final"]
         hf_selected = dwt2_rgb_tensor(x_rec, wavelet=wavelet)[1]
+    elif replacement_mode == "wgcp_v2_cm":
+        x_rec, wgcp_v2_meta = wgcp_v2_cm_output(
+            x_adv_chw=x_orig_chw,
+            x_cm_chw=x_pred_chw,
+            wavelet=wavelet,
+            levels=ms_levels,
+            c1_gamma_text=ms_gamma_levels,
+            c1_ll_alpha=ms_ll_alpha,
+            eps=ms_eps,
+            target_hw=target_hw,
+        )
+        ll_anchor = wgcp_v2_meta["ll_final"]
+        hf_selected = wgcp_v2_meta["hf_final"]
+    elif replacement_mode == "wgcp_v2_fuse":
+        x_rec, wgcp_v2_meta = wgcp_v2_lowfreq_fusion(
+            x_adv_chw=x_orig_chw,
+            x_cm_chw=x_pred_chw,
+            wavelet=wavelet,
+            levels=ms_levels,
+            c1_gamma_text=ms_gamma_levels,
+            c1_ll_alpha=ms_ll_alpha,
+            eps=ms_eps,
+            target_hw=target_hw,
+        )
+        ll_anchor = wgcp_v2_meta["ll_final"]
+        hf_selected = wgcp_v2_meta["hf_final"]
+    elif replacement_mode == "wgcp_v2_opt":
+        x_rec, wgcp_v2_meta = wgcp_v2_optimize(
+            x_adv_chw=x_orig_chw,
+            x_cm_chw=x_pred_chw,
+            wavelet=wavelet,
+            levels=ms_levels,
+            c1_gamma_text=ms_gamma_levels,
+            c1_ll_alpha=ms_ll_alpha,
+            lambda_ll_text=wgcp_v2_lambda_ll_levels,
+            lambda_h_text=wgcp_v2_lambda_h_levels,
+            lambda_hh_text=wgcp_v2_lambda_hh_levels,
+            pixel_gamma=wgcp_v2_pixel_gamma,
+            steps=wgcp_v2_steps,
+            lr=wgcp_v2_lr,
+            eps=ms_eps,
+            target_hw=target_hw,
+        )
+        ll_anchor = wgcp_v2_meta["ll_final"]
+        hf_selected = wgcp_v2_meta["hf_final"]
     elif replacement_mode == "adaptive_ms_edge":
         x_rec, adaptive_meta = adaptive_multiscale_edge_fusion(
             x_orig_chw=x_orig_chw,
@@ -200,6 +262,7 @@ def _reconstruct_from_prediction(
         "ll_anchor": ll_anchor,
         "hf_selected": hf_selected,
         "adaptive_ms": adaptive_meta,
+        "wgcp_v2": wgcp_v2_meta,
     }
     return x_rec, meta
 
@@ -307,6 +370,12 @@ def _purify_adv_tensor_global(
     ms_edge_channel_agg: bool = True,
     ms_modmax_threshold: float = 0.15,
     ms_modmax_boost_levels: str = "0.10,0.08,0.05",
+    wgcp_v2_steps: int = 15,
+    wgcp_v2_lr: float = 0.01,
+    wgcp_v2_pixel_gamma: float = 1.0,
+    wgcp_v2_lambda_ll_levels: str = "10.0,10.0,10.0",
+    wgcp_v2_lambda_h_levels: str = "1.0,1.0,1.0",
+    wgcp_v2_lambda_hh_levels: str = "0.5,0.5,0.5",
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     if x_adv.ndim != 4 or x_adv.shape[0] != 1:
         raise ValueError("x_adv must have shape [1, C, H, W]")
@@ -349,6 +418,12 @@ def _purify_adv_tensor_global(
         ms_edge_channel_agg=ms_edge_channel_agg,
         ms_modmax_threshold=ms_modmax_threshold,
         ms_modmax_boost_levels=ms_modmax_boost_levels,
+        wgcp_v2_steps=wgcp_v2_steps,
+        wgcp_v2_lr=wgcp_v2_lr,
+        wgcp_v2_pixel_gamma=wgcp_v2_pixel_gamma,
+        wgcp_v2_lambda_ll_levels=wgcp_v2_lambda_ll_levels,
+        wgcp_v2_lambda_h_levels=wgcp_v2_lambda_h_levels,
+        wgcp_v2_lambda_hh_levels=wgcp_v2_lambda_hh_levels,
         orig_components=orig_components,
     )
 
@@ -388,6 +463,12 @@ def _purify_adv_tensor_global(
             ms_edge_channel_agg=ms_edge_channel_agg,
             ms_modmax_threshold=ms_modmax_threshold,
             ms_modmax_boost_levels=ms_modmax_boost_levels,
+            wgcp_v2_steps=wgcp_v2_steps,
+            wgcp_v2_lr=wgcp_v2_lr,
+            wgcp_v2_pixel_gamma=wgcp_v2_pixel_gamma,
+            wgcp_v2_lambda_ll_levels=wgcp_v2_lambda_ll_levels,
+            wgcp_v2_lambda_h_levels=wgcp_v2_lambda_h_levels,
+            wgcp_v2_lambda_hh_levels=wgcp_v2_lambda_hh_levels,
             orig_components=orig_components,
         )
         current = x_k.to(x_adv.device).unsqueeze(0).clamp(0.0, 1.0)
@@ -418,6 +499,7 @@ def _purify_adv_tensor_global(
             "hard_hf_source": ablation_hard_hf_source,
         },
         "adaptive_ms": first_meta["adaptive_ms"],
+        "wgcp_v2": first_meta["wgcp_v2"],
         "predictor_calls": 1 + len(loop_steps),
     }
     return x_corrected, current, trace, infer_ms
@@ -463,6 +545,12 @@ def purify_adv_tensor(
     ms_edge_channel_agg: bool = True,
     ms_modmax_threshold: float = 0.15,
     ms_modmax_boost_levels: str = "0.10,0.08,0.05",
+    wgcp_v2_steps: int = 15,
+    wgcp_v2_lr: float = 0.01,
+    wgcp_v2_pixel_gamma: float = 1.0,
+    wgcp_v2_lambda_ll_levels: str = "10.0,10.0,10.0",
+    wgcp_v2_lambda_h_levels: str = "1.0,1.0,1.0",
+    wgcp_v2_lambda_hh_levels: str = "0.5,0.5,0.5",
 ) -> Tuple[Tensor, Tensor, Dict[str, object], float]:
     if not patch_mode:
         return _purify_adv_tensor_global(
@@ -497,6 +585,12 @@ def purify_adv_tensor(
             ms_edge_channel_agg=ms_edge_channel_agg,
             ms_modmax_threshold=ms_modmax_threshold,
             ms_modmax_boost_levels=ms_modmax_boost_levels,
+            wgcp_v2_steps=wgcp_v2_steps,
+            wgcp_v2_lr=wgcp_v2_lr,
+            wgcp_v2_pixel_gamma=wgcp_v2_pixel_gamma,
+            wgcp_v2_lambda_ll_levels=wgcp_v2_lambda_ll_levels,
+            wgcp_v2_lambda_h_levels=wgcp_v2_lambda_h_levels,
+            wgcp_v2_lambda_hh_levels=wgcp_v2_lambda_hh_levels,
         )
 
     if x_adv.ndim != 4 or x_adv.shape[0] != 1:
@@ -539,6 +633,12 @@ def purify_adv_tensor(
         ms_edge_channel_agg=ms_edge_channel_agg,
         ms_modmax_threshold=ms_modmax_threshold,
         ms_modmax_boost_levels=ms_modmax_boost_levels,
+        wgcp_v2_steps=wgcp_v2_steps,
+        wgcp_v2_lr=wgcp_v2_lr,
+        wgcp_v2_pixel_gamma=wgcp_v2_pixel_gamma,
+        wgcp_v2_lambda_ll_levels=wgcp_v2_lambda_ll_levels,
+        wgcp_v2_lambda_h_levels=wgcp_v2_lambda_h_levels,
+        wgcp_v2_lambda_hh_levels=wgcp_v2_lambda_hh_levels,
     )
 
     alpha_t = float(alpha_bars[t_star].item())
@@ -591,6 +691,12 @@ def purify_adv_tensor(
                 ms_edge_channel_agg=ms_edge_channel_agg,
                 ms_modmax_threshold=ms_modmax_threshold,
                 ms_modmax_boost_levels=ms_modmax_boost_levels,
+                wgcp_v2_steps=wgcp_v2_steps,
+                wgcp_v2_lr=wgcp_v2_lr,
+                wgcp_v2_pixel_gamma=wgcp_v2_pixel_gamma,
+                wgcp_v2_lambda_ll_levels=wgcp_v2_lambda_ll_levels,
+                wgcp_v2_lambda_h_levels=wgcp_v2_lambda_h_levels,
+                wgcp_v2_lambda_hh_levels=wgcp_v2_lambda_hh_levels,
                 ll_source_override=patch_ll_source,
             )
             rec_batch.append(rec_p.to(x_adv.device))
@@ -659,6 +765,12 @@ def purify_adv_tensor(
                 ms_edge_channel_agg=ms_edge_channel_agg,
                 ms_modmax_threshold=ms_modmax_threshold,
                 ms_modmax_boost_levels=ms_modmax_boost_levels,
+                wgcp_v2_steps=wgcp_v2_steps,
+                wgcp_v2_lr=wgcp_v2_lr,
+                wgcp_v2_pixel_gamma=wgcp_v2_pixel_gamma,
+                wgcp_v2_lambda_ll_levels=wgcp_v2_lambda_ll_levels,
+                wgcp_v2_lambda_h_levels=wgcp_v2_lambda_h_levels,
+                wgcp_v2_lambda_hh_levels=wgcp_v2_lambda_hh_levels,
                 orig_components=(ll_orig, hf_orig),
                 forced_ll_anchor=ll_anchor,
             )
@@ -694,6 +806,12 @@ def purify_adv_tensor(
                 ms_edge_channel_agg=ms_edge_channel_agg,
                 ms_modmax_threshold=ms_modmax_threshold,
                 ms_modmax_boost_levels=ms_modmax_boost_levels,
+                wgcp_v2_steps=wgcp_v2_steps,
+                wgcp_v2_lr=wgcp_v2_lr,
+                wgcp_v2_pixel_gamma=wgcp_v2_pixel_gamma,
+                wgcp_v2_lambda_ll_levels=wgcp_v2_lambda_ll_levels,
+                wgcp_v2_lambda_h_levels=wgcp_v2_lambda_h_levels,
+                wgcp_v2_lambda_hh_levels=wgcp_v2_lambda_hh_levels,
                 orig_components=(ll_orig, hf_orig),
             )
             hf_k_selected = dwt2_rgb_tensor(x_k, wavelet=wavelet)[1]
@@ -740,6 +858,7 @@ def purify_adv_tensor(
             "predictor_ms_global": float(infer_base_ms),
             "predictor_ms_patch": float(infer_patch_ms),
         },
+        "wgcp_v2": base_trace.get("wgcp_v2"),
         "predictor_calls": int(1 + patch_predictor_calls + len(loop_steps)),
     }
     return x_corrected, current, trace, infer_ms_total
@@ -804,6 +923,12 @@ def process_one_image(
         ms_edge_channel_agg=args.ms_edge_channel_agg,
         ms_modmax_threshold=args.ms_modmax_threshold,
         ms_modmax_boost_levels=args.ms_modmax_boost_levels,
+        wgcp_v2_steps=args.wgcp_v2_steps,
+        wgcp_v2_lr=args.wgcp_v2_lr,
+        wgcp_v2_pixel_gamma=args.wgcp_v2_pixel_gamma,
+        wgcp_v2_lambda_ll_levels=args.wgcp_v2_lambda_ll_levels,
+        wgcp_v2_lambda_h_levels=args.wgcp_v2_lambda_h_levels,
+        wgcp_v2_lambda_hh_levels=args.wgcp_v2_lambda_hh_levels,
     )
 
     ll_orig = trace["ll_orig"]
@@ -818,6 +943,14 @@ def process_one_image(
 
     x0_hat = trace["x0_hat"]
     save_tensor_image(x0_hat[0], sample_dir / "03_x0_hat.png")
+    wgcp_v2 = trace.get("wgcp_v2")
+    if isinstance(wgcp_v2, dict):
+        x_cm = wgcp_v2.get("x_cm")
+        x_c1 = wgcp_v2.get("x_c1")
+        if torch.is_tensor(x_cm):
+            save_tensor_image(x_cm, sample_dir / "03b_x_cm.png")
+        if torch.is_tensor(x_c1):
+            save_tensor_image(x_c1, sample_dir / "03c_x_c1_ref.png")
 
     ll_hat = trace["ll_hat"]
     ll_anchor = trace["ll_anchor"]
@@ -900,6 +1033,12 @@ def process_one_image(
         "ms_edge_channel_agg": bool(args.ms_edge_channel_agg),
         "ms_modmax_threshold": args.ms_modmax_threshold,
         "ms_modmax_boost_levels": args.ms_modmax_boost_levels,
+        "wgcp_v2_steps": args.wgcp_v2_steps,
+        "wgcp_v2_lr": args.wgcp_v2_lr,
+        "wgcp_v2_pixel_gamma": args.wgcp_v2_pixel_gamma,
+        "wgcp_v2_lambda_ll_levels": args.wgcp_v2_lambda_ll_levels,
+        "wgcp_v2_lambda_h_levels": args.wgcp_v2_lambda_h_levels,
+        "wgcp_v2_lambda_hh_levels": args.wgcp_v2_lambda_hh_levels,
         "replacement_mode": args.replacement_mode,
         "ablation_ll_source": args.ablation_ll_source,
         "ablation_hard_hf_source": args.ablation_hard_hf_source,
