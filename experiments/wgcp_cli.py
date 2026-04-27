@@ -80,11 +80,12 @@ def parse_args() -> argparse.Namespace:
             "fused",
             "adaptive_ms",
             "adaptive_ms_guided",
+            "adaptive_ms_w2lite",
             "adaptive_ms_edge",
             "adaptive_ms_modmax",
             "adaptive_ms_prior",
         ],
-        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale / predictor-guided shrinkage",
+        help="HF replacement strategy: hard / fused / adaptive multi-scale / guided adaptive multi-scale / W2-lite predictor-HF blend / predictor-guided shrinkage",
     )
     parser.add_argument(
         "--ablation_ll_source",
@@ -143,6 +144,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="0.20,0.12,0.08",
         help="Guided mode predictor HF residual mix schedule by level1->L (comma separated).",
+    )
+    parser.add_argument(
+        "--ms_w2_hf_mix_levels",
+        type=str,
+        default="1.0,1.0,1.0",
+        help="W2-lite predictor HF mix schedule by level1->L (1=all predictor HF, 0=all C1-shrunk original HF).",
     )
     parser.add_argument(
         "--ms_hf_gate_tau",

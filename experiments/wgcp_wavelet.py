@@ -556,6 +556,68 @@ def adaptive_multiscale_guided_fusion(
     return x_rec, meta
 
 
+def adaptive_multiscale_w2lite_fusion(
+    x_orig_chw: Tensor,
+    x_pred_chw: Tensor,
+    wavelet: str,
+    levels: int,
+    gamma_text: str,
+    ll_alpha: float,
+    hf_mix_text: str,
+    eps: float = 1e-6,
+    target_hw: Optional[Tuple[int, int]] = None,
+) -> Tuple[Tensor, Dict[str, object]]:
+    ll_orig, hf_orig_levels, use_levels = wavedec2_rgb_tensor(x_orig_chw, wavelet=wavelet, levels=levels)
+    ll_pred, hf_pred_levels_map, _ = wavedec2_rgb_tensor(x_pred_chw, wavelet=wavelet, levels=use_levels)
+    gamma_sched = resolve_ms_gamma_schedule(use_levels, gamma_text)
+    pred_mix_sched = resolve_level_schedule(use_levels, hf_mix_text, fallback=1.0)
+
+    ll_a = float(np.clip(ll_alpha, 0.0, 1.0))
+    ll_final = (1.0 - ll_a) * ll_pred + ll_a * ll_orig
+
+    hf_final_levels: Dict[int, Dict[str, Tensor]] = {}
+    level_stats: Dict[str, Dict[str, float]] = {}
+    for level in range(1, use_levels + 1):
+        gamma = float(gamma_sched[level])
+        pred_mix = float(np.clip(pred_mix_sched[level], 0.0, 1.0))
+        lvl_stats: Dict[str, float] = {"gamma": gamma, "pred_mix": pred_mix}
+        hf_final_levels[level] = {}
+        for band in ("HL", "LH", "HH"):
+            orig = hf_orig_levels[level][band]
+            pred = hf_pred_levels_map[level][band]
+
+            sigma_orig = median_abs_deviation(orig, eps=eps) / 0.6745
+            sigma_pred = median_abs_deviation(pred, eps=eps) / 0.6745
+            n_coeff = max(2.0, float(orig.shape[-2] * orig.shape[-1]))
+            base = math.sqrt(2.0 * math.log(n_coeff))
+            tau_orig = gamma * sigma_orig * base
+            tau_pred = gamma * sigma_pred * base
+
+            orig_denoised = soft_shrink(orig, tau_orig)
+            pred_denoised = soft_shrink(pred, tau_pred)
+            hf_final_levels[level][band] = (1.0 - pred_mix) * orig_denoised + pred_mix * pred_denoised
+
+            lvl_stats[f"sigma_mean_orig_{band}"] = float(sigma_orig.mean().item())
+            lvl_stats[f"sigma_mean_pred_{band}"] = float(sigma_pred.mean().item())
+            lvl_stats[f"tau_mean_orig_{band}"] = float(tau_orig.mean().item())
+            lvl_stats[f"tau_mean_pred_{band}"] = float(tau_pred.mean().item())
+        level_stats[f"L{level}"] = lvl_stats
+
+    x_rec = waverec2_rgb_tensor(ll_final, hf_final_levels, wavelet=wavelet, target_hw=target_hw)
+    meta: Dict[str, object] = {
+        "levels": int(use_levels),
+        "gamma_schedule": {f"L{k}": float(v) for k, v in gamma_sched.items()},
+        "pred_mix_schedule": {f"L{k}": float(v) for k, v in pred_mix_sched.items()},
+        "ll_alpha": float(ll_a),
+        "level_stats": level_stats,
+        "ll_final": ll_final,
+        "hf_final_levels": hf_final_levels,
+        "ll_pred": ll_pred,
+        "hf_policy": "c1_ll_plus_predictor_hf_multiscale_blend",
+    }
+    return x_rec, meta
+
+
 def fuse_high_frequency(
     hf_orig: Dict[str, Tensor],
     hf_hat: Dict[str, Tensor],
