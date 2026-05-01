@@ -1,0 +1,68 @@
+experiment_name: small_dataset_debug_gaussian
+
+# Data stays outside code. On Windows PowerShell:
+#   $env:CAMP_DATA_ROOT="D:\Datasets\camp_small"
+#   $env:CAMP_OUTPUT_ROOT="D:\Runs\camp"
+dataset:
+  name: image_folder
+  root: ${CAMP_DATA_ROOT}/images
+  glob: "*.png"
+  image_size: 64
+  batch_size: 1
+  num_workers: 0
+  max_samples: 8
+
+classifier:
+  # Debug only. For meaningful results, replace with a trained classifier module.
+  name: tiny_conv_untrained
+  kwargs:
+    num_classes: 10
+  input_size: 64
+  resize_short: 64
+  normalize: none
+
+attack:
+  name: pgd
+  norm: linf
+  eps: 0.03137254901960784
+  steps: 2
+  step_size: 0.00784313725490196
+  random_start: true
+
+purification:
+  model_type: module
+  model_module: experiments.camp.debug_models:GaussianX0Predictor
+  model_input_range: zero_one
+  model_output_range: zero_one
+  model_time_mode: t_index
+  model_input_kind: xt
+  model_prediction_type: x0
+  model_kwargs:
+    kernel_size: 5
+    sigma: 1.0
+    mix: 0.6
+  class_cond: false
+  schedule:
+    num_diffusion_steps: 1000
+    beta_start: 0.0001
+    beta_end: 0.02
+    sampling_steps: 2
+    iN: 20
+    gamma: 0.02
+    eta: 0.0
+  wavelet_noise:
+    enabled: true
+    wavelet: db2
+    levels: 1
+    gains: [1.05]
+    bands: [HL, LH, HH]
+  bp:
+    enabled: false
+    mu: 0.0
+
+evaluation:
+  seed: 42
+  device: cpu
+  output_dir: ${CAMP_OUTPUT_ROOT}/small_debug
+  save_images: true
+  lightweight: true

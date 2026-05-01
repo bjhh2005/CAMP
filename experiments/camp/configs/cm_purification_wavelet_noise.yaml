@@ -1,0 +1,58 @@
+experiment_name: cm_purification_wavelet_noise
+
+dataset:
+  root: data/images
+  glob: "*.png"
+  image_size: 256
+  batch_size: 1
+  num_workers: 4
+
+classifier:
+  name: torchvision_resnet50
+  input_size: 224
+  resize_short: 256
+  normalize: imagenet
+
+attack:
+  name: pgd
+  norm: linf
+  eps: 0.03137254901960784
+  steps: 10
+  step_size: 0.00784313725490196
+  random_start: true
+
+purification:
+  model_type: module
+  model_module: experiments.cm_adapter_sony:CMRepoPredictor
+  model_input_range: zero_one
+  model_output_range: zero_one
+  model_time_mode: t_index
+  model_input_kind: xt
+  model_prediction_type: x0
+  model_kwargs:
+    ctm_repo: /path/to/sony_ctm
+    checkpoint: /path/to/cm_checkpoint.pt
+    data_name: imagenet64
+    predictor_image_size: 64
+    class_cond: true
+  class_cond: true
+  schedule:
+    sampling_steps: 4
+    iN: 80
+    gamma: 0.02
+    eta: 0.0
+  wavelet_noise:
+    enabled: true
+    wavelet: db2
+    levels: 2
+    gains: [1.0, 1.1]
+    bands: [HL, LH, HH]
+  bp:
+    enabled: false
+    mu: 0.0
+
+evaluation:
+  seed: 42
+  device: cuda
+  output_dir: outputs/camp/cm_purification_wavelet_noise
+  save_images: false

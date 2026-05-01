@@ -1,0 +1,69 @@
+experiment_name: small_dataset_real_cm
+
+# Required environment variables:
+#   CAMP_DATA_ROOT   -> dataset root outside repo
+#   CAMP_MODEL_ROOT  -> model/checkpoint root outside repo
+#   CAMP_OUTPUT_ROOT -> run output root outside repo
+dataset:
+  name: image_folder
+  root: ${CAMP_DATA_ROOT}/images
+  glob: "*.png"
+  image_size: 64
+  batch_size: 1
+  num_workers: 2
+  max_samples: 128
+
+classifier:
+  # Replace with your trained small-dataset classifier.
+  module: your_package.your_classifier:YourClassifier
+  kwargs:
+    checkpoint: ${CAMP_MODEL_ROOT}/classifiers/small_classifier.pt
+    num_classes: 10
+  input_size: 64
+  resize_short: 64
+  normalize: none
+
+attack:
+  name: pgd
+  norm: linf
+  eps: 0.03137254901960784
+  steps: 10
+  step_size: 0.00784313725490196
+  random_start: true
+
+purification:
+  model_type: module
+  model_module: experiments.cm_adapter_sony:CMRepoPredictor
+  model_input_range: zero_one
+  model_output_range: zero_one
+  model_time_mode: t_index
+  model_input_kind: xt
+  model_prediction_type: x0
+  model_kwargs:
+    ctm_repo: ${CAMP_MODEL_ROOT}/third_party/sony_ctm
+    checkpoint: ${CAMP_MODEL_ROOT}/generators/cm_checkpoint.pt
+    data_name: imagenet64
+    predictor_image_size: 64
+    class_cond: false
+  class_cond: false
+  schedule:
+    sampling_steps: 4
+    iN: 40
+    gamma: 0.02
+    eta: 0.0
+  wavelet_noise:
+    enabled: false
+    wavelet: db2
+    levels: 1
+    gains: [1.0]
+  bp:
+    enabled: false
+    mu: 0.0
+
+evaluation:
+  seed: 42
+  device: cuda
+  output_dir: ${CAMP_OUTPUT_ROOT}/small_cm
+  save_images: false
+  lightweight: true
+

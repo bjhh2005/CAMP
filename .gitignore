@@ -214,6 +214,9 @@ third_party/ctm/
 configs/ctm_server_config.json
 .camp_runs/
 run_archive/
+local_*.yaml
+local_*.yml
+local_*.json
 
 # Marimo
 marimo/_static/
@@ -222,3 +225,9 @@ __marimo__/
 
 imagenette2-320.tgz
 imagenette2-320/
+
+*.md
+!docs/**/*.md
+!README.md
+CM4IR/
+FreqPure/
