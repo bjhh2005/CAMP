@@ -1,170 +1,163 @@
-# CAMP-CM 小数据集即插即用指南
+# CAMP-CM CIFAR-10 运行指南
 
-## 1. 项目边界
+这份文档只保留当前要用的 CIFAR-10 实验流程。`CM4IR/` 和 `FreqPure/` 仍只作为参考代码；CAMP 自有代码在 `experiments/camp/`。
 
-CAMP 自有代码只放在 `experiments/camp/`。`CM4IR/` 和 `FreqPure/` 只作为参考代码，不直接修改。
+## 1. 已配置路径
 
-数据、模型、输出必须和代码分离：
-
-- 数据放在仓库外，例如 `D:\Datasets\camp_small` 或 `/data/camp_small`
-- 模型放在仓库外，例如 `D:\Models\camp` 或 `/data/models/camp`
-- 输出放在仓库外或 `outputs/`，不要提交到 Git
-
-## 2. 推荐目录
-
-Windows 示例：
+当前模板默认使用你的服务器路径：
 
 ```text
-D:\Repositories\CAMP                  # 代码仓库
-D:\Datasets\camp_small\images         # 小数据集图片
-D:\Models\camp                        # 分类器和生成模型权重
-D:\Users\<you>\camp_runs              # 实验输出，或任何你有写权限的目录
+数据集:     /SSD_Data01/HHY/datasets/CIFAR-10
+分类器:     /SSD_Data01/HHY/classifiers/cifar10_resnet56/cifar10_resnet56.pt
+一致性模型: /SSD_Data01/HHY/generators/cm_cifar_10/cd-lpips-cifar10.pt
 ```
 
-Linux 服务器示例：
+路径规则：
+
+- `dataset.root` 写数据集根目录，不写文件名。你当前目录下有 `cifar-10-batches-py`，这是正确的。
+- `classifier.kwargs.checkpoint` 推荐写到具体 `.pt/.pth/.ckpt` 文件。
+- `purification.model_kwargs.checkpoint` 推荐写到具体 CM checkpoint 文件。
+- `purification.model_kwargs.ctm_repo` 必须是 Sony/CTM 代码仓库目录，且里面应存在 `code/cm/script_util.py`。如果 `/SSD_Data01/HHY/generators/cm_cifar_10` 只是权重目录，就需要把 `ctm_repo` 改成真实代码仓库路径。
+
+数据、模型、输出与代码分离。不要把数据集、权重、运行输出提交到 Git。
+
+## 2. 直接运行
+
+先检查配置：
+
+```bash
+bash scripts/camp_cifar10_dry_run.sh
+```
+
+这个脚本会做两件事：
+
+1. 展开并打印配置。
+2. 检查数据、分类器 checkpoint、CM checkpoint、`ctm_repo/code/cm/script_util.py` 是否存在。
+
+跑 16 张冒烟测试：
+
+```bash
+bash scripts/camp_cifar10_smoke.sh
+```
+
+跑 baseline：
+
+```bash
+MAX_SAMPLES=256 OUTPUT_DIR=outputs/camp/cifar10_baseline \
+  bash scripts/camp_cifar10_baseline.sh
+```
+
+跑小波噪声版本：
+
+```bash
+MAX_SAMPLES=256 OUTPUT_DIR=outputs/camp/cifar10_wavelet_noise \
+  bash scripts/camp_cifar10_wavelet.sh
+```
+
+扫描加噪强度 `iN`：
+
+```bash
+MAX_SAMPLES=256 I_N_VALUES="20 40 80" \
+  bash scripts/camp_cifar10_sweep_iN.sh
+```
+
+## 3. 输出怎么看
+
+每次运行会在 `OUTPUT_DIR` 下生成：
 
 ```text
-/home/you/CAMP                        # 代码仓库
-/data/camp_small/images               # 小数据集图片
-/data/models/camp                     # 分类器和生成模型权重
-/data/runs/camp                       # 实验输出
+resolved_config.json   # 本次实际配置
+summary.json           # 指标与逐样本结果
+analysis.md            # 自动分析文档
+images/*_triplet.png   # clean / adv / purified 三联图
 ```
 
-`image_folder` 数据格式：
+优先看 `analysis.md`。里面包含：
 
-```text
-images/
-  000001.png
-  000002.png
-  ...
-```
+- 关键指标：攻击成功率、净化恢复率、净化后一致率
+- 关键参数：攻击、CM 时间步、小波、BP 等
+- 若干 `clean / adv / purified` 可视化图
+- 失败样本表
 
-`class_folder` 数据格式：
-
-```text
-images/
-  class_a/
-    000001.png
-  class_b/
-    000002.png
-```
-
-当前评估默认使用分类器 clean prediction 作为 pseudo-label，所以 `image_folder` 足够先跑 PGD 净化链路。
-
-## 3. 环境变量
-
-Windows PowerShell：
-
-```powershell
-$env:CAMP_DATA_ROOT="D:\Datasets\camp_small"
-$env:CAMP_MODEL_ROOT="D:\Models\camp"
-$env:CAMP_OUTPUT_ROOT="$HOME\camp_runs"
-```
-
-Linux：
+已有结果也可以补生成报告：
 
 ```bash
-export CAMP_DATA_ROOT=/data/camp_small
-export CAMP_MODEL_ROOT=/data/models/camp
-export CAMP_OUTPUT_ROOT=/data/runs/camp
+bash scripts/camp_make_report.sh outputs/camp/cifar10_baseline
 ```
 
-配置文件会自动展开 `${CAMP_DATA_ROOT}`、`${CAMP_MODEL_ROOT}`、`${CAMP_OUTPUT_ROOT}`。
+## 4. configs 是什么
 
-## 4. 本地冒烟测试
+日常只需要关注两个配置：
 
-这个命令不需要真实 CM 权重，只检查数据读取、PGD、净化循环、图片输出是否连通：
+| 配置 | 作用 |
+|---|---|
+| `experiments/camp/configs/cifar10_cm_baseline.yaml` | 无小波、无 BP 的 CM 净化基线 |
+| `experiments/camp/configs/cifar10_cm_wavelet_noise.yaml` | 在 `z_hat_minus` 上启用小波高频增益 |
+
+其他配置是通用模板或 debug 用：
+
+| 配置 | 作用 |
+|---|---|
+| `small_debug.yaml` | 无真实权重的工程冒烟 |
+| `small_cm_template.yaml` | 其他小数据集模板 |
+| `cm_purification_*.yaml` | 后续扩展到通用图像/高分辨率时用 |
+
+## 5. 后续怎么改参数
+
+不要直接改模板。复制一份本地配置：
 
 ```bash
-python -m experiments.camp.run_purification \
-  --config experiments/camp/configs/small_debug.yaml
+cp experiments/camp/configs/cifar10_cm_baseline.yaml local_cifar10_iN40.yaml
 ```
 
-只检查配置展开、不读写数据：
+`local_*.yaml` 已被 `.gitignore` 忽略，适合放临时实验参数。
+
+常改字段：
+
+```yaml
+dataset:
+  max_samples: 512
+
+attack:
+  steps: 20
+
+purification:
+  schedule:
+    sampling_steps: 4
+    iN: 40
+    gamma: 0.02
+    eta: 0.0
+  wavelet_noise:
+    enabled: true
+    wavelet: db2
+    levels: 1
+    gains: [1.1]
+  bp:
+    enabled: false
+```
+
+用本地配置运行：
 
 ```bash
-python -m experiments.camp.run_purification \
-  --config experiments/camp/configs/small_debug.yaml \
-  --dry_run
+CONFIG=local_cifar10_iN40.yaml \
+MAX_SAMPLES=512 \
+OUTPUT_DIR=outputs/camp/local_cifar10_iN40 \
+bash scripts/camp_cifar10_baseline.sh
 ```
 
-输出：
+## 6. checkpoint 注意事项
 
-```text
-${CAMP_OUTPUT_ROOT}/small_debug/
-  resolved_config.json
-  summary.json
-  images/
+当前配置允许 `checkpoint` 指向目录，程序会自动选择目录下排序后的第一个 `.pt/.pth/.ckpt`。
+
+为了复现实验，建议确认后改成具体文件：
+
+```yaml
+classifier:
+  kwargs:
+    checkpoint: /SSD_Data01/HHY/classifiers/cifar10_resnet56/resnet56_best.pth
+
+purification:
+  model_kwargs:
+    ctm_repo: /path/to/sony_ctm_repo
+    checkpoint: /SSD_Data01/HHY/generators/cm_cifar_10/cm_cifar10.pt
 ```
-
-注意：`small_debug.yaml` 使用未训练分类器和 Gaussian debug purifier，只用于检查工程链路，不代表研究结果。
-
-## 5. 真实小数据集实验
-
-复制模板，不要直接改模板：
-
-```bash
-cp experiments/camp/configs/small_cm_template.yaml local_small_cm.yaml
-```
-
-需要替换：
-
-- `classifier.module`
-- `classifier.kwargs.checkpoint`
-- `purification.model_module`
-- `purification.model_kwargs.ctm_repo`
-- `purification.model_kwargs.checkpoint`
-- `dataset.root`
-- `evaluation.output_dir`
-
-运行：
-
-```bash
-python -m experiments.camp.run_purification \
-  --config local_small_cm.yaml
-```
-
-建议小数据集第一轮参数：
-
-- `dataset.image_size: 64`
-- `dataset.max_samples: 64`
-- `attack.steps: 10`
-- `purification.schedule.sampling_steps: 2` 或 `4`
-- `purification.schedule.iN: 20, 40, 80` 分别扫
-- `purification.bp.enabled: false`
-
-## 6. 三组最小对照
-
-先跑这三组，不要一开始铺太大：
-
-1. Baseline：`wavelet_noise.enabled=false`, `bp.enabled=false`
-2. Wavelet noise：`wavelet_noise.enabled=true`, `bp.enabled=false`
-3. Joint：`wavelet_noise.enabled=true`, `bp.enabled=true`, `bp.mu=0.05` 或 `0.1`
-
-可从以下模板开始：
-
-- `experiments/camp/configs/cm_purification_baseline.yaml`
-- `experiments/camp/configs/cm_purification_wavelet_noise.yaml`
-- `experiments/camp/configs/cm_purification_wavelet_noise_bp.yaml`
-- `experiments/camp/configs/small_cm_template.yaml`
-
-## 7. 输出指标
-
-每次运行生成：
-
-- `resolved_config.json`：完整展开后的配置
-- `summary.json`：聚合结果和逐样本结果
-
-重点看：
-
-- `attack_success_rate`
-- `recover_rate_on_attacked`
-- `purified_same_as_clean_rate`
-- 每个样本的 `sigma_schedule`
-
-## 8. 当前源码入口
-
-- `experiments/camp/run_purification.py`：主入口
-- `experiments/camp/cm_purifier.py`：少步 CM 净化循环
-- `experiments/camp/wavelet_ops.py`：小波噪声注入和小波 BP
-- `experiments/camp/configs/`：配置模板

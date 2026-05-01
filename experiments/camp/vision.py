@@ -50,6 +50,11 @@ def pil_to_tensor(img: Image.Image) -> Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1)
 
 
+class _TransformToTensor:
+    def __call__(self, img: Image.Image) -> Tensor:
+        return pil_to_tensor(img)
+
+
 def tensor_to_pil(x: Tensor) -> Image.Image:
     arr = (x.detach().cpu().clamp(0.0, 1.0).permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
     return Image.fromarray(arr)
@@ -153,6 +158,12 @@ def imagenet_normalize(x: Tensor) -> Tensor:
     return (x - mean) / std
 
 
+def cifar10_normalize(x: Tensor) -> Tensor:
+    mean = torch.tensor([0.4914, 0.4822, 0.4465], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    std = torch.tensor([0.2471, 0.2435, 0.2616], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+
 def classifier_preprocess(x: Tensor, config: ClassifierConfig) -> Tensor:
     out = x
     if config.resize_short > 0:
@@ -176,6 +187,8 @@ def classifier_preprocess(x: Tensor, config: ClassifierConfig) -> Tensor:
         out = out[:, :, top : top + size, left : left + size]
     if config.normalize == "imagenet":
         out = imagenet_normalize(out)
+    elif config.normalize == "cifar10":
+        out = cifar10_normalize(out)
     elif config.normalize in {"none", ""}:
         pass
     else:
@@ -193,6 +206,11 @@ def build_classifier(config: ClassifierConfig, device: torch.device) -> torch.nn
     else:
         if config.name == "tiny_conv_untrained":
             model = TinyConvClassifier(num_classes=int(config.kwargs.get("num_classes", 10)))
+            return model.eval().to(device)
+        if config.name == "cifar_resnet56":
+            from .cifar_models import build_cifar_resnet56
+
+            model = build_cifar_resnet56(**config.kwargs)
             return model.eval().to(device)
 
         from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50
@@ -259,3 +277,27 @@ def run_attack(
     if attack_config.name == "pgd" and attack_config.norm == "linf":
         return pgd_linf_attack(model, x, y, classifier_config, attack_config)
     raise ValueError(f"Unsupported attack: {attack_config.name}/{attack_config.norm}")
+
+
+def build_dataset(
+    name: str,
+    root: Path,
+    pattern: str,
+    image_size: Optional[int],
+    max_samples: int,
+    split: str,
+):
+    if name == "class_folder":
+        return ClassFolderDataset(root=root, pattern=pattern, image_size=image_size, max_samples=max_samples)
+    if name == "image_folder":
+        return ImageFolderDataset(root=root, pattern=pattern, image_size=image_size, max_samples=max_samples)
+    if name == "torchvision_cifar10":
+        from torchvision.datasets import CIFAR10
+        from torch.utils.data import Subset
+
+        train = str(split).lower() == "train"
+        dataset = CIFAR10(root=str(root), train=train, download=False, transform=_TransformToTensor())
+        if max_samples and max_samples > 0:
+            dataset = Subset(dataset, list(range(min(int(max_samples), len(dataset)))))
+        return dataset
+    raise ValueError(f"Unsupported dataset.name: {name}")

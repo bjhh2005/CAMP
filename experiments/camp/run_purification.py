@@ -14,8 +14,7 @@ try:
     from .config import config_to_dict, load_experiment_config
     from .model_adapters import build_generative_model
     from .vision import (
-        ClassFolderDataset,
-        ImageFolderDataset,
+        build_dataset,
         build_classifier,
         classify,
         run_attack,
@@ -29,8 +28,7 @@ except ImportError:
     from experiments.camp.config import config_to_dict, load_experiment_config
     from experiments.camp.model_adapters import build_generative_model
     from experiments.camp.vision import (
-        ClassFolderDataset,
-        ImageFolderDataset,
+        build_dataset,
         build_classifier,
         classify,
         run_attack,
@@ -39,6 +37,18 @@ except ImportError:
         to_minus_one_one,
         to_zero_one,
     )
+
+
+def save_triplet(clean, adv, purified, path: Path) -> None:
+    from PIL import Image
+
+    images = [tensor_to_pil(clean), tensor_to_pil(adv), tensor_to_pil(purified)]
+    canvas = Image.new("RGB", (sum(img.width for img in images), max(img.height for img in images)))
+    x_offset = 0
+    for image in images:
+        canvas.paste(image, (x_offset, 0))
+        x_offset += image.width
+    canvas.save(path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,22 +86,14 @@ def main() -> None:
     set_seed(config.evaluation.seed)
     device = torch.device(config.evaluation.device if torch.cuda.is_available() or config.evaluation.device == "cpu" else "cpu")
 
-    if config.dataset.name == "class_folder":
-        dataset = ClassFolderDataset(
-            root=Path(config.dataset.root),
-            pattern=config.dataset.glob,
-            image_size=config.dataset.image_size,
-            max_samples=config.dataset.max_samples,
-        )
-    elif config.dataset.name == "image_folder":
-        dataset = ImageFolderDataset(
-            root=Path(config.dataset.root),
-            pattern=config.dataset.glob,
-            image_size=config.dataset.image_size,
-            max_samples=config.dataset.max_samples,
-        )
-    else:
-        raise ValueError(f"Unsupported dataset.name: {config.dataset.name}")
+    dataset = build_dataset(
+        name=config.dataset.name,
+        root=Path(config.dataset.root),
+        pattern=config.dataset.glob,
+        image_size=config.dataset.image_size,
+        max_samples=config.dataset.max_samples,
+        split=config.dataset.split,
+    )
     loader = DataLoader(
         dataset,
         batch_size=int(config.dataset.batch_size),
@@ -114,8 +116,13 @@ def main() -> None:
         image_dir.mkdir(parents=True, exist_ok=True)
 
     for batch in tqdm(loader, desc=config.experiment_name):
-        x_clean = batch["image"].to(device).float()
-        paths = list(batch["path"])
+        if isinstance(batch, dict):
+            x_clean = batch["image"].to(device).float()
+            paths = list(batch["path"])
+        else:
+            x_clean, labels = batch
+            x_clean = x_clean.to(device).float()
+            paths = [f"{config.dataset.name}:{len(samples) + i:06d}" for i in range(x_clean.shape[0])]
         pred_clean, conf_clean = classify(classifier, x_clean, config.classifier)
         y_ref = pred_clean.detach()
         x_adv = run_attack(classifier, x_clean, y_ref, config.classifier, config.attack)
@@ -147,11 +154,26 @@ def main() -> None:
                 "sigma_schedule": result.trace.get("sigma", []),
             }
             samples.append(record)
+            artifacts: Dict[str, object] = {}
             if config.evaluation.save_images:
                 stem = Path(path).stem
-                tensor_to_pil(x_clean[i]).save(image_dir / f"{stem}_clean.png")
-                tensor_to_pil(x_adv[i]).save(image_dir / f"{stem}_adv.png")
-                tensor_to_pil(x_purified[i]).save(image_dir / f"{stem}_purified.png")
+                if not stem or ":" in stem:
+                    stem = f"sample_{len(samples):06d}"
+                clean_path = image_dir / f"{stem}_clean.png"
+                adv_path = image_dir / f"{stem}_adv.png"
+                purified_path = image_dir / f"{stem}_purified.png"
+                triplet_path = image_dir / f"{stem}_triplet.png"
+                tensor_to_pil(x_clean[i]).save(clean_path)
+                tensor_to_pil(x_adv[i]).save(adv_path)
+                tensor_to_pil(x_purified[i]).save(purified_path)
+                save_triplet(x_clean[i], x_adv[i], x_purified[i], triplet_path)
+                artifacts = {
+                    "clean": str(clean_path),
+                    "adv": str(adv_path),
+                    "purified": str(purified_path),
+                    "triplet": str(triplet_path),
+                }
+            record["artifacts"] = artifacts
 
     aggregate = {
         "num_samples": len(samples),

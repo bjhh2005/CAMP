@@ -1,0 +1,76 @@
+experiment_name: cifar10_cm_baseline_no_wavelet_no_bp
+
+dataset:
+  # Uses torchvision.datasets.CIFAR10 with download=False.
+  # Expected root contains CIFAR-10/cifar-10-batches-py or compatible files.
+  name: torchvision_cifar10
+  root: /SSD_Data01/HHY/datasets/CIFAR-10
+  split: test
+  glob: "*"
+  image_size: null
+  batch_size: 1
+  num_workers: 2
+  max_samples: 0
+
+classifier:
+  name: cifar_resnet56
+  kwargs:
+    checkpoint: /SSD_Data01/HHY/classifiers/cifar10_resnet56/cifar10_resnet56.pt
+    num_classes: 10
+    strict_load: false
+  input_size: 32
+  resize_short: 0
+  normalize: cifar10
+
+attack:
+  name: pgd
+  norm: linf
+  eps: 0.03137254901960784
+  steps: 10
+  step_size: 0.00784313725490196
+  random_start: true
+
+purification:
+  model_type: module
+  model_module: experiments.cm_adapter_sony:CMRepoPredictor
+  model_input_range: zero_one
+  model_output_range: zero_one
+  model_time_mode: t_index
+  model_input_kind: xt
+  model_prediction_type: x0
+  model_kwargs:
+    # ctm_repo must point to the Sony/CTM code repo directory containing code/cm/script_util.py.
+    # If this directory only contains cd-lpips-cifar10.pt, replace ctm_repo with the real code repo path.
+    ctm_repo: /SSD_Data01/HHY/generators/cm_cifar_10
+    checkpoint: /SSD_Data01/HHY/generators/cm_cifar_10/cd-lpips-cifar10.pt
+    data_name: cifar10
+    predictor_image_size: 32
+    class_cond: false
+    use_fp16: false
+  class_cond: false
+  schedule:
+    num_diffusion_steps: 1000
+    beta_start: 0.0001
+    beta_end: 0.02
+    sampling_steps: 2
+    iN: 20
+    gamma: 0.02
+    eta: 0.0
+    sigma_min: 0.002
+    sigma_max: 80.0
+  wavelet_noise:
+    enabled: false
+    wavelet: db2
+    levels: 1
+    gains: [1.0]
+    bands: [HL, LH, HH]
+  bp:
+    enabled: false
+    mu: 0.0
+
+evaluation:
+  seed: 42
+  device: cuda
+  output_dir: outputs/camp/cifar10_cm_baseline
+  save_images: false
+  lightweight: true

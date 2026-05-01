@@ -54,7 +54,7 @@ class CMRepoPredictor:
         **_: Any,
     ) -> None:
         self.ctm_repo = Path(ctm_repo).resolve()
-        self.checkpoint = Path(checkpoint).resolve()
+        self.checkpoint = self._resolve_checkpoint_path(Path(checkpoint).resolve())
         self.device = torch.device(device)
         self.data_name = data_name
         self.num_diffusion_steps = int(num_diffusion_steps)
@@ -163,6 +163,17 @@ class CMRepoPredictor:
         self.use_fp16 = bool(getattr(self.args, "use_fp16", False) and self.device.type == "cuda")
         self.compute_dtype = torch.float32
         self.model.eval()
+
+    def _resolve_checkpoint_path(self, checkpoint: Path) -> Path:
+        if checkpoint.is_file():
+            return checkpoint
+        if checkpoint.is_dir():
+            candidates: List[Path] = []
+            for pattern in ("*.pt", "*.pth", "*.ckpt"):
+                candidates.extend(sorted(checkpoint.glob(pattern)))
+            if candidates:
+                return candidates[0]
+        return checkpoint
 
     def set_class_label(self, class_label: int) -> None:
         self.class_label = int(class_label)
