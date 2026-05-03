@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG="${CONFIG:-experiments/camp/configs/cifar10_cm_baseline.yaml}"
+CONFIG="${CONFIG:-experiments/camp/configs/cifar10_cm_openai_jax.yaml}"
 
 python -m experiments.camp.run_purification \
   --config "$CONFIG" \

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG="${CONFIG:-experiments/camp/configs/cifar10_cm_baseline.yaml}"
+CONFIG="${CONFIG:-experiments/camp/configs/cifar10_cm_openai_jax.yaml}"
 MAX_SAMPLES="${MAX_SAMPLES:-16}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/camp/cifar10_smoke}"
 DEVICE="${DEVICE:-cuda}"
@@ -24,4 +24,3 @@ python -m experiments.camp.report --run_dir "$OUTPUT_DIR" --max_images 8
 echo "Smoke run complete:"
 echo "  Summary: $OUTPUT_DIR/summary.json"
 echo "  Report:  $OUTPUT_DIR/analysis.md"
-

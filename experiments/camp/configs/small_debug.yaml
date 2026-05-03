@@ -30,8 +30,9 @@ attack:
   random_start: true
 
 purification:
+  backend: debug_gaussian
   model_type: module
-  model_module: experiments.camp.debug_models:GaussianX0Predictor
+  model_module: ""
   model_input_range: zero_one
   model_output_range: zero_one
   model_time_mode: t_index

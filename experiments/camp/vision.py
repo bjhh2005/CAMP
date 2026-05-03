@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torch.utils.data import Subset
 from torch.utils.data import Dataset
 
 from .config import AttackConfig, ClassifierConfig
@@ -249,6 +250,13 @@ def pgd_linf_attack(
 ) -> Tensor:
     eps = float(attack_config.eps)
     step_size = float(attack_config.step_size)
+    steps = int(attack_config.steps)
+    if eps < 0.0:
+        raise ValueError("attack.eps must be non-negative")
+    if step_size < 0.0:
+        raise ValueError("attack.step_size must be non-negative")
+    if steps < 0:
+        raise ValueError("attack.steps must be non-negative")
     if attack_config.random_start:
         delta = torch.empty_like(x).uniform_(-eps, eps)
     else:
@@ -256,7 +264,7 @@ def pgd_linf_attack(
     delta = (x + delta).clamp(0.0, 1.0) - x
     delta.requires_grad_(True)
 
-    for _ in range(int(attack_config.steps)):
+    for _ in range(steps):
         logits = classifier_logits(model, (x + delta).clamp(0.0, 1.0), classifier_config)
         loss = F.cross_entropy(logits, y)
         grad = torch.autograd.grad(loss, delta, only_inputs=True)[0]
@@ -293,9 +301,16 @@ def build_dataset(
         return ImageFolderDataset(root=root, pattern=pattern, image_size=image_size, max_samples=max_samples)
     if name == "torchvision_cifar10":
         from torchvision.datasets import CIFAR10
-        from torch.utils.data import Subset
 
         train = str(split).lower() == "train"
+        if not root.exists():
+            raise FileNotFoundError(f"CIFAR-10 root not found: {root}")
+        dataset_dir = root / "cifar-10-batches-py"
+        if not dataset_dir.exists():
+            raise FileNotFoundError(
+                f"CIFAR-10 python batches not found: {dataset_dir}. "
+                "Download/extract CIFAR-10 there or update dataset.root."
+            )
         dataset = CIFAR10(root=str(root), train=train, download=False, transform=_TransformToTensor())
         if max_samples and max_samples > 0:
             dataset = Subset(dataset, list(range(min(int(max_samples), len(dataset)))))

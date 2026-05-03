@@ -1,10 +1,8 @@
 # CAMP-CM CIFAR-10 运行指南
 
-这份文档只保留当前要用的 CIFAR-10 实验流程。`CM4IR/` 和 `FreqPure/` 仍只作为参考代码；CAMP 自有代码在 `experiments/camp/`。
+这份文档只保留当前 CIFAR-10 实验流程。`CM4IR/` 和 `FreqPure/` 只作为参考代码；CAMP 自有代码在 `experiments/camp/`。
 
-## 1. 已配置路径
-
-当前模板默认使用你的服务器路径：
+## 1. 当前路径
 
 ```text
 数据集:     /SSD_Data01/HHY/datasets/CIFAR-10
@@ -14,27 +12,63 @@
 
 路径规则：
 
-- `dataset.root` 写数据集根目录，不写文件名。你当前目录下有 `cifar-10-batches-py`，这是正确的。
-- `classifier.kwargs.checkpoint` 推荐写到具体 `.pt/.pth/.ckpt` 文件。
-- `purification.model_kwargs.checkpoint` 推荐写到具体 CM checkpoint 文件。
-- `purification.model_kwargs.ctm_repo` 必须是 Sony/CTM 代码仓库目录，且里面应存在 `code/cm/script_util.py`。如果 `/SSD_Data01/HHY/generators/cm_cifar_10` 只是权重目录，就需要把 `ctm_repo` 改成真实代码仓库路径。
+- `dataset.root` 写数据集根目录，不写文件名；你当前目录下有 `cifar-10-batches-py`，这是正确的。
+- `classifier.kwargs.checkpoint` 写到具体分类器权重文件。
+- `purification.model_kwargs.checkpoint` 写到具体 CM 权重文件。
+- 数据、模型、输出与代码分离，不要提交到 Git。
 
-数据、模型、输出与代码分离。不要把数据集、权重、运行输出提交到 Git。
+## 2. 生成模型 backend
 
-## 2. 直接运行
+现在主流程只调用统一接口：
 
-先检查配置：
+```text
+backend.predict_x0(x_t, context) -> x0_hat
+```
+
+不同 checkpoint 格式由不同 backend adapter 处理：
+
+| backend | 用途 | 状态 |
+|---|---|---|
+| `debug_gaussian` | 无权重冒烟 | 可用 |
+| `sony_cm` | Sony/CTM 代码体系中的 PyTorch CM/CTM checkpoint | 可用，但要求 checkpoint 兼容 Sony 代码 |
+| `openai_cifar_jax` | OpenAI CIFAR-10 JAX/Flax CM checkpoint | 已接入，会动态导入 OpenAI JAX repo 并调用 distiller 推理 |
+
+你的 `cd-lpips-cifar10.pt` 如果 `torch.load` 报：
+
+```text
+invalid load key, '\xa4'
+```
+
+大概率是 JAX/Flax 格式，不应该用 `sony_cm`。应走：
+
+```yaml
+purification:
+  backend: openai_cifar_jax
+  model_input_range: minus_one_one
+  model_output_range: minus_one_one
+  model_kwargs:
+    repo: /SSD_Data01/HHY/openai_cm_cifar10
+    checkpoint: /SSD_Data01/HHY/generators/cm_cifar_10/cd-lpips-cifar10.pt
+```
+
+其中 `repo` 是 OpenAI CIFAR-10 CM 的 JAX 源码目录，目录下应有 `jcm/models/utils.py`、`jcm/checkpoints.py` 等文件。运行环境需要安装该 repo 的 JAX/Flax/Haiku/Optax 依赖。
+
+检查 checkpoint 格式：
+
+```bash
+python -m experiments.camp.checkpoint_format \
+  /SSD_Data01/HHY/generators/cm_cifar_10/cd-lpips-cifar10.pt
+```
+
+## 3. 直接运行
+
+先检查配置和路径：
 
 ```bash
 bash scripts/camp_cifar10_dry_run.sh
 ```
 
-这个脚本会做两件事：
-
-1. 展开并打印配置。
-2. 检查数据、分类器 checkpoint、CM checkpoint、`ctm_repo/code/cm/script_util.py` 是否存在。
-
-跑 16 张冒烟测试：
+跑 16 张冒烟：
 
 ```bash
 bash scripts/camp_cifar10_smoke.sh
@@ -54,47 +88,43 @@ MAX_SAMPLES=256 OUTPUT_DIR=outputs/camp/cifar10_wavelet_noise \
   bash scripts/camp_cifar10_wavelet.sh
 ```
 
-扫描加噪强度 `iN`：
+扫描 `iN`：
 
 ```bash
 MAX_SAMPLES=256 I_N_VALUES="20 40 80" \
   bash scripts/camp_cifar10_sweep_iN.sh
 ```
 
-## 3. 输出怎么看
+## 4. 输出怎么看
 
 每次运行会在 `OUTPUT_DIR` 下生成：
 
 ```text
-resolved_config.json   # 本次实际配置
-summary.json           # 指标与逐样本结果
-analysis.md            # 自动分析文档
-images/*_triplet.png   # clean / adv / purified 三联图
+resolved_config.json
+summary.json
+analysis.md
+images/*_triplet.png
 ```
 
-优先看 `analysis.md`。里面包含：
+优先看 `analysis.md`。它包含关键指标、关键参数、三联图和失败样本表。
 
-- 关键指标：攻击成功率、净化恢复率、净化后一致率
-- 关键参数：攻击、CM 时间步、小波、BP 等
-- 若干 `clean / adv / purified` 可视化图
-- 失败样本表
-
-已有结果也可以补生成报告：
+已有结果也可以补报告：
 
 ```bash
 bash scripts/camp_make_report.sh outputs/camp/cifar10_baseline
 ```
 
-## 4. configs 是什么
+## 5. configs 是什么
 
-日常只需要关注两个配置：
+日常主要看：
 
 | 配置 | 作用 |
 |---|---|
-| `experiments/camp/configs/cifar10_cm_baseline.yaml` | 无小波、无 BP 的 CM 净化基线 |
-| `experiments/camp/configs/cifar10_cm_wavelet_noise.yaml` | 在 `z_hat_minus` 上启用小波高频增益 |
+| `cifar10_cm_openai_jax.yaml` | OpenAI CIFAR-10 JAX/Flax CM 入口 |
+| `cifar10_cm_baseline.yaml` | Sony/PyTorch 兼容 checkpoint 的 baseline |
+| `cifar10_cm_wavelet_noise.yaml` | Sony/PyTorch 兼容 checkpoint 的小波噪声版本 |
 
-其他配置是通用模板或 debug 用：
+其他配置：
 
 | 配置 | 作用 |
 |---|---|
@@ -102,15 +132,15 @@ bash scripts/camp_make_report.sh outputs/camp/cifar10_baseline
 | `small_cm_template.yaml` | 其他小数据集模板 |
 | `cm_purification_*.yaml` | 后续扩展到通用图像/高分辨率时用 |
 
-## 5. 后续怎么改参数
+## 6. 后续怎么改参数
 
-不要直接改模板。复制一份本地配置：
+不要直接改模板，复制本地配置：
 
 ```bash
-cp experiments/camp/configs/cifar10_cm_baseline.yaml local_cifar10_iN40.yaml
+cp experiments/camp/configs/cifar10_cm_openai_jax.yaml local_cifar10_iN40.yaml
 ```
 
-`local_*.yaml` 已被 `.gitignore` 忽略，适合放临时实验参数。
+`local_*.yaml` 已被 `.gitignore` 忽略。
 
 常改字段：
 
@@ -136,28 +166,11 @@ purification:
     enabled: false
 ```
 
-用本地配置运行：
+运行本地配置：
 
 ```bash
 CONFIG=local_cifar10_iN40.yaml \
 MAX_SAMPLES=512 \
 OUTPUT_DIR=outputs/camp/local_cifar10_iN40 \
 bash scripts/camp_cifar10_baseline.sh
-```
-
-## 6. checkpoint 注意事项
-
-当前配置允许 `checkpoint` 指向目录，程序会自动选择目录下排序后的第一个 `.pt/.pth/.ckpt`。
-
-为了复现实验，建议确认后改成具体文件：
-
-```yaml
-classifier:
-  kwargs:
-    checkpoint: /SSD_Data01/HHY/classifiers/cifar10_resnet56/resnet56_best.pth
-
-purification:
-  model_kwargs:
-    ctm_repo: /path/to/sony_ctm_repo
-    checkpoint: /SSD_Data01/HHY/generators/cm_cifar_10/cm_cifar10.pt
 ```

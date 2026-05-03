@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_CONFIG="${BASE_CONFIG:-experiments/camp/configs/cifar10_cm_baseline.yaml}"
+BASE_CONFIG="${BASE_CONFIG:-experiments/camp/configs/cifar10_cm_openai_jax.yaml}"
 MAX_SAMPLES="${MAX_SAMPLES:-256}"
 DEVICE="${DEVICE:-cuda}"
 ROOT_OUTPUT="${ROOT_OUTPUT:-outputs/camp/cifar10_sweep_iN}"
@@ -71,4 +71,3 @@ for name, agg in rows:
 (root / "sweep_overview.md").write_text("\n".join(lines), encoding="utf-8")
 print(f"Sweep overview saved to: {root / 'sweep_overview.md'}")
 PY
-

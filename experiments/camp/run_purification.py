@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -12,7 +12,7 @@ from tqdm import tqdm
 try:
     from .cm_purifier import CMPurifier
     from .config import config_to_dict, load_experiment_config
-    from .model_adapters import build_generative_model
+    from .adapters.registry import build_backend
     from .vision import (
         build_dataset,
         build_classifier,
@@ -26,7 +26,7 @@ try:
 except ImportError:
     from experiments.camp.cm_purifier import CMPurifier
     from experiments.camp.config import config_to_dict, load_experiment_config
-    from experiments.camp.model_adapters import build_generative_model
+    from experiments.camp.adapters.registry import build_backend
     from experiments.camp.vision import (
         build_dataset,
         build_classifier,
@@ -49,6 +49,36 @@ def save_triplet(clean, adv, purified, path: Path) -> None:
         canvas.paste(image, (x_offset, 0))
         x_offset += image.width
     canvas.save(path)
+
+
+def _resolve_device(requested: str) -> torch.device:
+    requested = str(requested or "cpu").strip().lower()
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        print(f"[WARN] Requested device '{requested}' but CUDA is unavailable; falling back to CPU.")
+        return torch.device("cpu")
+    return torch.device(requested)
+
+
+def _unpack_batch(batch, dataset_name: str, sample_offset: int, device: torch.device) -> Tuple[torch.Tensor, List[str], torch.Tensor | None]:
+    if isinstance(batch, dict):
+        x_clean = batch["image"].to(device).float()
+        raw_paths = batch.get("path")
+        if raw_paths is None:
+            paths = [f"{dataset_name}:{sample_offset + i:06d}" for i in range(x_clean.shape[0])]
+        else:
+            paths = [str(item) for item in raw_paths]
+        labels = batch.get("label")
+        labels_t = labels.to(device).long() if torch.is_tensor(labels) else None
+        return x_clean, paths, labels_t
+
+    if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+        x_clean, labels = batch[0], batch[1]
+        x_clean = x_clean.to(device).float()
+        labels_t = labels.to(device).long() if torch.is_tensor(labels) else None
+        paths = [f"{dataset_name}:{sample_offset + i:06d}" for i in range(x_clean.shape[0])]
+        return x_clean, paths, labels_t
+
+    raise TypeError(f"Unsupported dataloader batch type: {type(batch)!r}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,7 +114,7 @@ def main() -> None:
         json.dump(config_to_dict(config), handle, ensure_ascii=False, indent=2)
 
     set_seed(config.evaluation.seed)
-    device = torch.device(config.evaluation.device if torch.cuda.is_available() or config.evaluation.device == "cpu" else "cpu")
+    device = _resolve_device(config.evaluation.device)
 
     dataset = build_dataset(
         name=config.dataset.name,
@@ -101,11 +131,12 @@ def main() -> None:
         num_workers=int(config.dataset.num_workers),
     )
     classifier = build_classifier(config.classifier, device=device)
-    gen_model = build_generative_model(config.purification, device=device)
+    gen_model = build_backend(config.purification, device=device)
     purifier = CMPurifier(config.purification, model=gen_model, device=device)
 
     samples: List[Dict[str, object]] = []
     clean_correct = 0
+    clean_labeled = 0
     adv_same = 0
     purified_same = 0
     recovered = 0
@@ -116,14 +147,16 @@ def main() -> None:
         image_dir.mkdir(parents=True, exist_ok=True)
 
     for batch in tqdm(loader, desc=config.experiment_name):
-        if isinstance(batch, dict):
-            x_clean = batch["image"].to(device).float()
-            paths = list(batch["path"])
-        else:
-            x_clean, labels = batch
-            x_clean = x_clean.to(device).float()
+        x_clean, paths, labels = _unpack_batch(
+            batch,
+            dataset_name=config.dataset.name,
+            sample_offset=len(samples),
+            device=device,
+        )
+        if len(paths) != x_clean.shape[0]:
             paths = [f"{config.dataset.name}:{len(samples) + i:06d}" for i in range(x_clean.shape[0])]
         pred_clean, conf_clean = classify(classifier, x_clean, config.classifier)
+        labels_valid = labels is not None and labels.numel() == pred_clean.numel() and bool(torch.all(labels >= 0).item())
         y_ref = pred_clean.detach()
         x_adv = run_attack(classifier, x_clean, y_ref, config.classifier, config.attack)
         pred_adv, conf_adv = classify(classifier, x_adv, config.classifier)
@@ -138,11 +171,15 @@ def main() -> None:
             recover_success = bool(pred_purified[i].item() == pred_clean[i].item())
             attacked += int(attack_success)
             recovered += int(attack_success and recover_success)
-            clean_correct += 1
+            true_label = int(labels[i].item()) if labels_valid else None
+            if true_label is not None:
+                clean_labeled += 1
+                clean_correct += int(pred_clean[i].item() == true_label)
             adv_same += int(pred_adv[i].item() == pred_clean[i].item())
             purified_same += int(recover_success)
             record = {
                 "path": path,
+                "true_label": true_label,
                 "clean_pred": int(pred_clean[i].item()),
                 "adv_pred": int(pred_adv[i].item()),
                 "purified_pred": int(pred_purified[i].item()),
@@ -177,6 +214,7 @@ def main() -> None:
 
     aggregate = {
         "num_samples": len(samples),
+        "clean_accuracy_on_labeled": clean_correct / max(1, clean_labeled),
         "attack_success_rate": attacked / max(1, len(samples)),
         "adv_same_as_clean_rate": adv_same / max(1, len(samples)),
         "recover_rate_on_attacked": recovered / max(1, attacked),

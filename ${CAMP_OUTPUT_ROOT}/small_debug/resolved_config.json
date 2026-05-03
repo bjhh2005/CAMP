@@ -1,0 +1,101 @@
+{
+  "experiment_name": "small_dataset_debug_gaussian",
+  "dataset": {
+    "name": "image_folder",
+    "root": "${CAMP_DATA_ROOT}/images",
+    "split": "val",
+    "image_size": 64,
+    "batch_size": 1,
+    "num_workers": 0,
+    "max_samples": 1,
+    "glob": "*.png"
+  },
+  "classifier": {
+    "name": "tiny_conv_untrained",
+    "module": "",
+    "kwargs": {
+      "num_classes": 10
+    },
+    "input_size": 64,
+    "resize_short": 64,
+    "normalize": "none"
+  },
+  "attack": {
+    "name": "pgd",
+    "eps": 0.03137254901960784,
+    "steps": 2,
+    "step_size": 0.00784313725490196,
+    "random_start": true,
+    "norm": "linf"
+  },
+  "purification": {
+    "backend": "debug_gaussian",
+    "model_type": "module",
+    "model_module": "",
+    "model_kwargs": {
+      "kernel_size": 5,
+      "sigma": 1.0,
+      "mix": 0.6
+    },
+    "model_input_range": "zero_one",
+    "model_output_range": "zero_one",
+    "model_time_mode": "t_index",
+    "model_input_kind": "xt",
+    "model_prediction_type": "x0",
+    "class_cond": false,
+    "default_class_label": 0,
+    "schedule": {
+      "num_diffusion_steps": 1000,
+      "beta_start": 0.0001,
+      "beta_end": 0.02,
+      "sampling_steps": 2,
+      "iN": 20,
+      "gamma": 0.02,
+      "eta": 0.0,
+      "sigma_min": 0.002,
+      "sigma_max": 80.0
+    },
+    "wavelet_noise": {
+      "enabled": true,
+      "wavelet": "db2",
+      "levels": 1,
+      "gains": [
+        1.05
+      ],
+      "bands": [
+        "HL",
+        "LH",
+        "HH"
+      ]
+    },
+    "bp": {
+      "enabled": false,
+      "mu": 0.0,
+      "mu_factor": 1.0,
+      "zeta": 0.0,
+      "sigma_y": 0.0,
+      "wavelet": {
+        "enabled": false,
+        "wavelet": "db2",
+        "levels": 2,
+        "highfreq_scales": [
+          1.0,
+          0.5
+        ],
+        "lowfreq_scale": 1.0,
+        "bands": [
+          "HL",
+          "LH",
+          "HH"
+        ]
+      }
+    }
+  },
+  "evaluation": {
+    "seed": 42,
+    "device": "cpu",
+    "output_dir": "${CAMP_OUTPUT_ROOT}/small_debug",
+    "save_images": true,
+    "lightweight": true
+  }
+}

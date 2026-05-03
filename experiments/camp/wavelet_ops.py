@@ -30,7 +30,9 @@ def wavedec2_chw(x_chw: Tensor, wavelet: str, levels: int):
     x_np = _to_numpy_chw(x_chw)
     wave = pywt.Wavelet(wavelet)
     max_level = pywt.dwt_max_level(min(int(x_chw.shape[-2]), int(x_chw.shape[-1])), wave.dec_len)
-    use_levels = max(1, min(int(levels), int(max_level)))
+    use_levels = min(int(levels), int(max_level))
+    if use_levels < 1:
+        return None, 0
     channel_coeffs = [
         pywt.wavedec2(x_np[channel], wavelet=wavelet, mode=WAVELET_MODE, level=use_levels)
         for channel in range(x_np.shape[0])
@@ -69,6 +71,9 @@ def reweight_high_frequency(
     out = []
     for sample in x:
         coeffs, use_levels = wavedec2_chw(sample, wavelet=wavelet, levels=levels)
+        if use_levels < 1:
+            out.append(sample.clone())
+            continue
         new_coeffs = []
         for channel_coeffs in coeffs:
             current = [channel_coeffs[0] * float(lowfreq_scale)]
@@ -121,4 +126,3 @@ def attenuate_bp_guidance(
         bands=bands,
         lowfreq_scale=lowfreq_scale,
     )
-

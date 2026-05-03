@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .config import load_experiment_config
+from .checkpoint_format import guess_checkpoint_format, recommended_backend
 
 
 def _check_path(label: str, path_text: str, must_be_file: bool = False, must_be_dir: bool = False) -> bool:
@@ -25,7 +26,8 @@ def main() -> None:
     cfg = load_experiment_config(args.config)
 
     ok = True
-    ok &= _check_path("dataset.root", cfg.dataset.root, must_be_dir=True)
+    if cfg.dataset.name != "debug_synthetic":
+        ok &= _check_path("dataset.root", cfg.dataset.root, must_be_dir=True)
     if cfg.dataset.name == "torchvision_cifar10":
         ok &= _check_path("CIFAR-10 python batches", str(Path(cfg.dataset.root) / "cifar-10-batches-py"), must_be_dir=True)
 
@@ -35,6 +37,7 @@ def main() -> None:
 
     model_kwargs = cfg.purification.model_kwargs
     ctm_repo = str(model_kwargs.get("ctm_repo", ""))
+    openai_repo = str(model_kwargs.get("repo", ""))
     cm_ckpt = str(model_kwargs.get("checkpoint", ""))
     if ctm_repo:
         ok &= _check_path("purification.model_kwargs.ctm_repo", ctm_repo, must_be_dir=True)
@@ -43,8 +46,24 @@ def main() -> None:
             str(Path(ctm_repo) / "code" / "cm" / "script_util.py"),
             must_be_file=True,
         )
+    if openai_repo:
+        ok &= _check_path("purification.model_kwargs.repo", openai_repo, must_be_dir=True)
+        if cfg.purification.backend == "openai_cifar_jax":
+            ok &= _check_path(
+                "repo/jcm/models/utils.py",
+                str(Path(openai_repo) / "jcm" / "models" / "utils.py"),
+                must_be_file=True,
+            )
     if cm_ckpt:
         ok &= _check_path("purification.model_kwargs.checkpoint", cm_ckpt, must_be_file=True)
+        ckpt_fmt = guess_checkpoint_format(Path(cm_ckpt))
+        print(f"[INFO] checkpoint format guess: {ckpt_fmt}")
+        print(f"[INFO] recommended backend: {recommended_backend(ckpt_fmt)}")
+        if "flax_msgpack" in ckpt_fmt and cfg.purification.backend != "openai_cifar_jax":
+            print(
+                "[WARN] This checkpoint looks like JAX/Flax, but purification.backend is "
+                f"'{cfg.purification.backend}'. Consider using backend: openai_cifar_jax."
+            )
 
     if not ok:
         raise SystemExit(1)
@@ -53,4 +72,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

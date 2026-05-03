@@ -8,6 +8,7 @@ import torch
 from .config import PurificationConfig
 from .operators import IdentityOperator
 from .schedule import alpha_to_nearest_t_index, build_alpha_schedule, build_betas
+from .adapters.base import PredictionContext
 from .wavelet_ops import attenuate_bp_guidance, enhance_noise_estimate
 
 
@@ -87,24 +88,34 @@ class CMPurifier:
             ]
             rescaled_sigma_t = 1000.0 * 0.25 * torch.log(sigma_t + 1e-44)
             t_index = alpha_to_nearest_t_index(self.betas, at)
-            if self.config.model_input_kind == "cm_scaled":
-                model_input = c_in * xt
-            elif self.config.model_input_kind == "xt":
-                model_input = xt
+            context = PredictionContext(
+                sigma_t=sigma_t,
+                rescaled_sigma_t=rescaled_sigma_t,
+                t_index=t_index,
+                class_labels=classes,
+            )
+            if hasattr(self.model, "predict_x0"):
+                x0_t = self.model.predict_x0(xt, context).clamp(-1.0, 1.0)
             else:
-                raise ValueError(f"Unsupported model_input_kind: {self.config.model_input_kind}")
+                # Backward-compatible path for old callable model adapters.
+                if self.config.model_input_kind == "cm_scaled":
+                    model_input = c_in * xt
+                elif self.config.model_input_kind == "xt":
+                    model_input = xt
+                else:
+                    raise ValueError(f"Unsupported model_input_kind: {self.config.model_input_kind}")
 
-            if classes is None:
-                model_pred = self.model(model_input, sigma_t, rescaled_sigma_t, t_index=t_index)
-            else:
-                model_pred = self.model(model_input, sigma_t, rescaled_sigma_t, t_index=t_index, classes=classes)
+                if classes is None:
+                    model_pred = self.model(model_input, sigma_t, rescaled_sigma_t, t_index=t_index)
+                else:
+                    model_pred = self.model(model_input, sigma_t, rescaled_sigma_t, t_index=t_index, classes=classes)
 
-            if self.config.model_prediction_type == "network_output":
-                x0_t = (c_out * model_pred + c_skip * xt).clamp(-1.0, 1.0)
-            elif self.config.model_prediction_type == "x0":
-                x0_t = model_pred.clamp(-1.0, 1.0)
-            else:
-                raise ValueError(f"Unsupported model_prediction_type: {self.config.model_prediction_type}")
+                if self.config.model_prediction_type == "network_output":
+                    x0_t = (c_out * model_pred + c_skip * xt).clamp(-1.0, 1.0)
+                elif self.config.model_prediction_type == "x0":
+                    x0_t = model_pred.clamp(-1.0, 1.0)
+                else:
+                    raise ValueError(f"Unsupported model_prediction_type: {self.config.model_prediction_type}")
 
             z_hat_minus = (x0_t - xt) / sigma_t
             if self.config.wavelet_noise.enabled:

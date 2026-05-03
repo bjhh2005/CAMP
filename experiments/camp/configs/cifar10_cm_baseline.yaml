@@ -31,6 +31,9 @@ attack:
   random_start: true
 
 purification:
+  # This CIFAR-10 checkpoint is likely OpenAI JAX/Flax. If so, use backend=openai_cifar_jax
+  # after wiring the JAX adapter. backend=sony_cm only works for Sony/CTM-compatible PyTorch checkpoints.
+  backend: sony_cm
   model_type: module
   model_module: experiments.cm_adapter_sony:CMRepoPredictor
   model_input_range: zero_one

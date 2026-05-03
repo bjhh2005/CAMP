@@ -79,6 +79,7 @@ def build_report(run_dir: Path, output_path: Path, max_images: int) -> None:
     lines.append("|---|---:|")
     for key in (
         "num_samples",
+        "clean_accuracy_on_labeled",
         "attack_success_rate",
         "adv_same_as_clean_rate",
         "recover_rate_on_attacked",
@@ -100,8 +101,10 @@ def build_report(run_dir: Path, output_path: Path, max_images: int) -> None:
         ("attack.eps", _get(config, "attack.eps")),
         ("attack.steps", _get(config, "attack.steps")),
         ("attack.step_size", _get(config, "attack.step_size")),
+        ("backend", _get(config, "purification.backend")),
         ("model_module", _get(config, "purification.model_module")),
         ("cm_repo", _get(config, "purification.model_kwargs.ctm_repo")),
+        ("openai_repo", _get(config, "purification.model_kwargs.repo")),
         ("cm_checkpoint", _get(config, "purification.model_kwargs.checkpoint")),
         ("sampling_steps", _get(config, "purification.schedule.sampling_steps")),
         ("iN", _get(config, "purification.schedule.iN")),
@@ -193,4 +196,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

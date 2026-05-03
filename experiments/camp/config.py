@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -52,6 +53,7 @@ class BPConfig:
 
 @dataclass
 class PurificationConfig:
+    backend: str = "module"
     model_type: str = "module"
     model_module: str = ""
     model_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -118,6 +120,9 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
 
+_UNRESOLVED_ENV_PATTERN = re.compile(r"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)|%[A-Za-z_][A-Za-z0-9_]*%")
+
+
 def _merge_dict(base: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
     out = dict(base)
     for key, value in updates.items():
@@ -148,18 +153,70 @@ def _coerce_dataclass(cls: type, data: Mapping[str, Any]):
     return cls(**kwargs)
 
 
+def _find_unresolved_env_vars(text: str) -> List[str]:
+    matches = []
+    for match in _UNRESOLVED_ENV_PATTERN.finditer(text):
+        token = match.group(0)
+        name = token
+        if token.startswith("${") and token.endswith("}"):
+            name = token[2:-1]
+        elif token.startswith("$"):
+            name = token[1:]
+        elif token.startswith("%") and token.endswith("%"):
+            name = token[1:-1]
+        if name and name not in matches:
+            matches.append(name)
+    return matches
+
+
+def _find_unresolved_env_vars_in_obj(obj: Any) -> List[str]:
+    found: List[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            for name in _find_unresolved_env_vars(value):
+                if name not in found:
+                    found.append(name)
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(obj)
+    return found
+
+
 def _read_config_file(path: Path) -> Dict[str, Any]:
-    text = os.path.expandvars(path.read_text(encoding="utf-8"))
+    raw_text = path.read_text(encoding="utf-8")
+    text = os.path.expandvars(raw_text)
     suffix = path.suffix.lower()
     if suffix == ".json":
-        return json.loads(text)
+        loaded = json.loads(text)
+        unresolved = _find_unresolved_env_vars_in_obj(loaded)
+        if unresolved:
+            names = ", ".join(unresolved)
+            raise ValueError(
+                f"Unresolved environment variable(s) in config {path}: {names}. "
+                "Set them before running, or replace them with concrete paths."
+            )
+        return loaded
     if suffix in {".yml", ".yaml"}:
         try:
             import yaml
         except ImportError as exc:
             raise RuntimeError("PyYAML is required to read YAML config files") from exc
         loaded = yaml.safe_load(text)
-        return loaded or {}
+        loaded = loaded or {}
+        unresolved = _find_unresolved_env_vars_in_obj(loaded)
+        if unresolved:
+            names = ", ".join(unresolved)
+            raise ValueError(
+                f"Unresolved environment variable(s) in config {path}: {names}. "
+                "Set them before running, or replace them with concrete paths."
+            )
+        return loaded
     raise ValueError(f"Unsupported config suffix: {path.suffix}")
 
 
