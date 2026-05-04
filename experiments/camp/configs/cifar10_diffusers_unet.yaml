@@ -36,6 +36,7 @@ purification:
     model_dir: /SSD_Data01/HHY/generators/cifar10-32
     unet_subdir: unet
     scheduler_subdir: scheduler
+    scheduler_prediction_type: epsilon
     torch_dtype: float32
   class_cond: false
   schedule:

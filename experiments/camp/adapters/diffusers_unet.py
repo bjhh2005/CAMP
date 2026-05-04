@@ -26,6 +26,7 @@ class DiffusersUNetBackend:
         input_range: str = "minus_one_one",
         output_range: str = "minus_one_one",
         prediction_type: str = "",
+        scheduler_prediction_type: str = "",
         torch_dtype: str = "float32",
         device: str = "cuda",
         **_: Any,
@@ -33,7 +34,7 @@ class DiffusersUNetBackend:
         self.model_dir = Path(model_dir).expanduser().resolve() if model_dir else None
         self.input_range = input_range
         self.output_range = output_range
-        self.prediction_type_override = str(prediction_type or "").strip().lower()
+        self.prediction_type_override = str(scheduler_prediction_type or prediction_type or "").strip().lower()
         self.device = torch.device(device)
         self.torch_dtype = self._resolve_dtype(torch_dtype)
 
@@ -71,7 +72,12 @@ class DiffusersUNetBackend:
         raise ValueError(f"Unsupported torch_dtype for diffusers_unet: {name}")
 
     def _resolve_prediction_type(self) -> str:
-        if self.prediction_type_override:
+        # registry.py passes CAMP's generic model_prediction_type as
+        # prediction_type. Values such as network_output/x0 describe CAMP's old
+        # adapter contract, not diffusers scheduler prediction semantics.
+        if self.prediction_type_override in {"network_output", "x0"}:
+            pred = str(getattr(self.scheduler.config, "prediction_type", "epsilon")).lower()
+        elif self.prediction_type_override:
             pred = self.prediction_type_override
         else:
             pred = str(getattr(self.scheduler.config, "prediction_type", "epsilon")).lower()
