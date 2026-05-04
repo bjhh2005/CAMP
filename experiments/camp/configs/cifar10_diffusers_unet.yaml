@@ -1,0 +1,66 @@
+experiment_name: cifar10_diffusers_unet
+
+dataset:
+  name: torchvision_cifar10
+  root: /SSD_Data01/HHY/datasets/CIFAR-10
+  split: test
+  glob: "*"
+  image_size: null
+  batch_size: 1
+  num_workers: 2
+  max_samples: 0
+
+classifier:
+  name: cifar_resnet56
+  kwargs:
+    checkpoint: /SSD_Data01/HHY/classifiers/cifar10_resnet56/cifar10_resnet56.pt
+    num_classes: 10
+    strict_load: false
+  input_size: 32
+  resize_short: 0
+  normalize: cifar10
+
+attack:
+  name: pgd
+  norm: linf
+  eps: 0.03137254901960784
+  steps: 10
+  step_size: 0.00784313725490196
+  random_start: true
+
+purification:
+  backend: diffusers_unet
+  model_input_range: minus_one_one
+  model_output_range: minus_one_one
+  model_kwargs:
+    model_dir: /SSD_Data01/HHY/generators/cifar10-32
+    unet_subdir: unet
+    scheduler_subdir: scheduler
+    torch_dtype: float32
+  class_cond: false
+  schedule:
+    num_diffusion_steps: 1000
+    beta_start: 0.0001
+    beta_end: 0.02
+    sampling_steps: 2
+    iN: 20
+    gamma: 0.02
+    eta: 0.0
+    sigma_min: 0.002
+    sigma_max: 80.0
+  wavelet_noise:
+    enabled: false
+    wavelet: db2
+    levels: 1
+    gains: [1.0]
+    bands: [HL, LH, HH]
+  bp:
+    enabled: false
+    mu: 0.0
+
+evaluation:
+  seed: 42
+  device: cuda
+  output_dir: outputs/camp/cifar10_diffusers_unet
+  save_images: false
+  lightweight: true

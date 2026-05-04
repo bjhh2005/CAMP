@@ -67,9 +67,13 @@ def build_backend(config: PurificationConfig, device: torch.device) -> PurifierB
 
         return OpenAICIFARJAXBackend(device=str(device), **kwargs)
 
+    if backend_name == "diffusers_unet":
+        from .diffusers_unet import DiffusersUNetBackend
+
+        return DiffusersUNetBackend(device=str(device), **kwargs)
+
     if backend_name == "class_path":
         class_path = str(config.model_module).strip()
         return _build_from_class_path(class_path, kwargs, device=device)
 
     raise ValueError(f"Unsupported purification.backend: {backend_name}")
-

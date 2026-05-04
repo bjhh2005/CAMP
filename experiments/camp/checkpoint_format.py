@@ -25,7 +25,9 @@ def guess_checkpoint_format(path: Path) -> str:
         return "pytorch_zip_or_diffusers_weight"
     if head[:1] in {b"\x80"}:
         return "pytorch_pickle_or_python_pickle"
-    if head[:1] in {b"\xa4", b"\xde", b"\x82", b"\x83", b"\x84"}:
+    # Flax checkpoints are msgpack-serialized pytrees. Common first bytes are
+    # fixmap/fixstr/bin/map headers, for example 0x88 followed by "step".
+    if head[0] in {*range(0x80, 0x90), *range(0xA0, 0xC0), 0xC4, 0xC5, 0xC6, 0xDE, 0xDF}:
         return "flax_msgpack_probable"
     if b"version https://git-lfs.github.com/spec" in path.read_bytes()[:128]:
         return "git_lfs_pointer_not_downloaded"
@@ -55,4 +57,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

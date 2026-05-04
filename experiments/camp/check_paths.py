@@ -38,6 +38,7 @@ def main() -> None:
     model_kwargs = cfg.purification.model_kwargs
     ctm_repo = str(model_kwargs.get("ctm_repo", ""))
     openai_repo = str(model_kwargs.get("repo", ""))
+    diffusers_dir = str(model_kwargs.get("model_dir", ""))
     cm_ckpt = str(model_kwargs.get("checkpoint", ""))
     if ctm_repo:
         ok &= _check_path("purification.model_kwargs.ctm_repo", ctm_repo, must_be_dir=True)
@@ -54,6 +55,22 @@ def main() -> None:
                 str(Path(openai_repo) / "jcm" / "models" / "utils.py"),
                 must_be_file=True,
             )
+    if diffusers_dir:
+        ok &= _check_path("purification.model_kwargs.model_dir", diffusers_dir, must_be_dir=True)
+        if cfg.purification.backend == "diffusers_unet":
+            ok &= _check_path(
+                "model_dir/model_index.json",
+                str(Path(diffusers_dir) / "model_index.json"),
+                must_be_file=True,
+            )
+            ok &= _check_path(
+                "model_dir/unet",
+                str(Path(diffusers_dir) / "unet"),
+                must_be_dir=True,
+            )
+            ckpt_fmt = guess_checkpoint_format(Path(diffusers_dir))
+            print(f"[INFO] diffusers dir format guess: {ckpt_fmt}")
+            print(f"[INFO] recommended backend: {recommended_backend(ckpt_fmt)}")
     if cm_ckpt:
         ok &= _check_path("purification.model_kwargs.checkpoint", cm_ckpt, must_be_file=True)
         ckpt_fmt = guess_checkpoint_format(Path(cm_ckpt))
