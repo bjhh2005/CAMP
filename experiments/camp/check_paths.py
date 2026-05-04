@@ -57,7 +57,7 @@ def main() -> None:
             )
     if diffusers_dir:
         ok &= _check_path("purification.model_kwargs.model_dir", diffusers_dir, must_be_dir=True)
-        if cfg.purification.backend == "diffusers_unet":
+        if cfg.purification.backend in {"diffusers_unet", "diffusers_consistency"}:
             ok &= _check_path(
                 "model_dir/model_index.json",
                 str(Path(diffusers_dir) / "model_index.json"),

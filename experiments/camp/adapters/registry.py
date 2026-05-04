@@ -74,6 +74,11 @@ def build_backend(config: PurificationConfig, device: torch.device) -> PurifierB
 
         return DiffusersUNetBackend(device=str(device), **kwargs)
 
+    if backend_name == "diffusers_consistency":
+        from .diffusers_consistency import DiffusersConsistencyBackend
+
+        return DiffusersConsistencyBackend(device=str(device), **kwargs)
+
     if backend_name == "class_path":
         class_path = str(config.model_module).strip()
         return _build_from_class_path(class_path, kwargs, device=device)
