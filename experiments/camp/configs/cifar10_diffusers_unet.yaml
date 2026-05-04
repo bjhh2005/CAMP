@@ -38,7 +38,10 @@ purification:
     scheduler_subdir: scheduler
     scheduler_prediction_type: epsilon
     torch_dtype: float32
-  class_cond: false
+    class_cond: true
+    default_class_label: 0
+  class_cond: true
+  default_class_label: 0
   schedule:
     num_diffusion_steps: 1000
     beta_start: 0.0001

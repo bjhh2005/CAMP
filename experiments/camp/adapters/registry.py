@@ -46,6 +46,8 @@ def build_backend(config: PurificationConfig, device: torch.device) -> PurifierB
     kwargs.setdefault("time_mode", config.model_time_mode)
     kwargs.setdefault("input_kind", config.model_input_kind)
     kwargs.setdefault("prediction_type", config.model_prediction_type)
+    kwargs.setdefault("class_cond", config.class_cond)
+    kwargs.setdefault("default_class_label", config.default_class_label)
 
     if backend_name in {"", "module"}:
         if not config.model_module:

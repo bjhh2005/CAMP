@@ -27,6 +27,8 @@ class DiffusersUNetBackend:
         output_range: str = "minus_one_one",
         prediction_type: str = "",
         scheduler_prediction_type: str = "",
+        class_cond: bool = False,
+        default_class_label: int = 0,
         torch_dtype: str = "float32",
         device: str = "cuda",
         **_: Any,
@@ -35,6 +37,8 @@ class DiffusersUNetBackend:
         self.input_range = input_range
         self.output_range = output_range
         self.prediction_type_override = str(scheduler_prediction_type or prediction_type or "").strip().lower()
+        self.class_cond = bool(class_cond)
+        self.default_class_label = int(default_class_label)
         self.device = torch.device(device)
         self.torch_dtype = self._resolve_dtype(torch_dtype)
 
@@ -118,11 +122,26 @@ class DiffusersUNetBackend:
 
     @torch.no_grad()
     def predict_x0(self, x_t: torch.Tensor, context: PredictionContext) -> torch.Tensor:
-        if context.class_labels is not None:
-            raise ValueError("DiffusersUNetBackend currently supports unconditional UNet checkpoints only")
         timestep = self._timestep(context)
         sample = self._to_backend_input(x_t).to(device=self.device, dtype=self.torch_dtype)
         t = torch.full((sample.shape[0],), timestep, device=self.device, dtype=torch.long)
-        model_output = self.unet(sample, t).sample
+        class_labels = None
+        if self.class_cond:
+            if context.class_labels is None:
+                class_labels = torch.full(
+                    (sample.shape[0],),
+                    self.default_class_label,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            else:
+                class_labels = context.class_labels.to(device=self.device, dtype=torch.long).reshape(-1)
+                if class_labels.numel() == 1 and sample.shape[0] > 1:
+                    class_labels = class_labels.repeat(sample.shape[0])
+                if class_labels.numel() != sample.shape[0]:
+                    raise ValueError(
+                        f"class_labels batch mismatch: got {class_labels.numel()}, expected {sample.shape[0]}"
+                    )
+        model_output = self.unet(sample, t, class_labels=class_labels).sample
         x0 = self._predict_x0_from_model_output(sample, model_output, timestep)
         return self._to_minus_one_one(x0.float()).to(device=x_t.device, dtype=x_t.dtype)
